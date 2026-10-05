@@ -1,9 +1,9 @@
 //! HTTP Datagram framing and routing (RFC 9297 section 2.1, spec section 2.5).
 
-use super::Connection;
+use super::{Connection, Role};
 use crate::error::{ConnectionError, H3Code, UsageError};
 use crate::event::Datagram;
-use crate::stream::{SendPhase, StreamId};
+use crate::stream::{RecvPhase, SendPhase, StreamId};
 use crate::varint;
 
 /// Largest Quarter Stream ID: `q * 4` must stay a valid stream id (< 2^62).
@@ -20,8 +20,10 @@ impl Connection {
         if !s.is_request() {
             return Err(UsageError::WrongStreamKind);
         }
+        // A server answers only a delivered request (as `send_headers` does).
+        let delivered = |phase| self.role == Role::Client || phase != RecvPhase::AwaitHeaders;
         match self.streams.get(&s) {
-            Some(st) if st.send.phase != SendPhase::Done => {}
+            Some(st) if st.send.phase != SendPhase::Done && delivered(st.recv.phase) => {}
             _ => return Err(UsageError::WrongPhase),
         }
         Ok(varint::encode_to(s.0 / 4, buf))

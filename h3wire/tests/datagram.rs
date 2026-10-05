@@ -5,7 +5,7 @@ use h3wire::{
     UsageError,
 };
 use support::wire::{headers, settings};
-use support::{client_ready_with, feed_all, server_ready};
+use support::{client_ready_with, feed_all, server_ready, server_ready_with};
 
 const S0: StreamId = StreamId(0);
 const S4: StreamId = StreamId(4);
@@ -115,6 +115,20 @@ fn prefix_refused_after_send_side_closed() {
     assert!(std::iter::from_fn(|| c.poll_action()).any(|a| a == Action::FinishStream(S4)));
     let mut buf = [0u8; 8];
     assert_eq!(c.datagram_prefix(S4, &mut buf), Err(UsageError::WrongPhase));
+}
+
+#[test]
+fn server_prefix_needs_delivered_request() {
+    let mut buf = [0u8; 8];
+    let mut c = server_ready_with(cfg(true), &[(DG, 1)]);
+    let wire = get_wire();
+    let (head, last) = wire.split_at(wire.len() - 1);
+    // First sight of partial HEADERS creates the stream; the request is not delivered.
+    feed_all(&mut c, S4, head, false);
+    assert_eq!(c.datagram_prefix(S4, &mut buf), Err(UsageError::WrongPhase));
+    feed_all(&mut c, S4, last, false);
+    assert!(matches!(c.poll_event(), Some(Event::Headers { .. })));
+    assert_eq!(c.datagram_prefix(S4, &mut buf), Ok(1));
 }
 
 #[test]

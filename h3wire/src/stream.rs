@@ -162,10 +162,12 @@ impl SendState {
     }
 
     /// Mark `n` pending bytes as written; the caller checked `n <= pending().len()`.
+    /// A drained queue frees its buffer, so its capacity follows the bytes still queued
+    /// (`Connection::debug_bound`).
     pub fn advance(&mut self, n: usize) {
         self.read += n;
         if self.read == self.queue.len() {
-            self.queue.clear();
+            self.queue = Vec::new();
             self.read = 0;
         }
     }

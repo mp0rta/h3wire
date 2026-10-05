@@ -55,7 +55,8 @@
 //! - One write-blocked stream does not stall others: `setup::blocked_stream_does_not_stall_others`,
 //!   `acceptance::write_blocked_stream_in_pair`
 //!
-//! Also here: `memory_bound_holds_after_release` (spec section 5.3, "no unbounded memory
+//! Also here: `memory_bound_holds_after_release` and
+//! `memory_bound_does_not_grow_with_exchanges` (spec section 5.3, "no unbounded memory
 //! growth": the bound the `api_ops` fuzz target asserts).
 
 mod support;
@@ -230,4 +231,33 @@ fn memory_bound_holds_after_release() {
         c.release(b);
     }
     assert!(c.debug_buffered_bytes() <= c.debug_bound());
+}
+
+#[test]
+fn memory_bound_does_not_grow_with_exchanges() {
+    let mut p = Pair::new(Config::default(), Config::default());
+    p.run_to_completion_resolving();
+    let mut bounds = Vec::new();
+    for i in 0..200u64 {
+        let s = StreamId(4 * i);
+        p.client.send_headers(s, &get(), true).unwrap();
+        p.run_to_completion_resolving();
+        p.server
+            .send_headers(s, &[f(":status", "200")], false)
+            .unwrap();
+        p.run_to_completion_resolving();
+        p.send_body(Side::Server, s, b"hello", true);
+        p.run_to_completion_resolving();
+        for c in [&p.client, &p.server] {
+            assert!(c.debug_buffered_bytes() <= c.debug_bound());
+        }
+        if i == 9 || i == 199 {
+            bounds.push((p.client.debug_bound(), p.server.debug_bound()));
+        }
+    }
+    assert!(p.closed.is_empty());
+    assert_eq!(
+        bounds[0], bounds[1],
+        "debug_bound grew with the exchange count"
+    );
 }

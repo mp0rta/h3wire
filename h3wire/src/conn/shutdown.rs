@@ -64,10 +64,7 @@ impl Connection {
         self.goaway_sent = Some(id);
         let control = self.local_uni[UniKind::Control as usize];
         if let Some(st) = control.and_then(|c| self.streams.get_mut(&c)) {
-            let before = st.send.queue.len();
             encode_goaway(id, &mut st.send.queue);
-            let n = st.send.queue.len() - before;
-            self.send_queues_len = self.send_queues_len.saturating_add(n);
         }
     }
 

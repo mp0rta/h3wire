@@ -487,6 +487,11 @@ pub fn server_ready(cfg: Config) -> Connection {
     ready(Role::Server, cfg, &[])
 }
 
+/// Like `server_ready`, with the client's SETTINGS carrying `peer`.
+pub fn server_ready_with(cfg: Config, peer: &[(u64, u64)]) -> Connection {
+    ready(Role::Server, cfg, peer)
+}
+
 /// A client whose uni streams are bound and written and whose peer SETTINGS (empty) arrived.
 pub fn client_ready(cfg: Config) -> Connection {
     client_ready_with(cfg, &[])

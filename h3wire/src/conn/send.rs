@@ -43,7 +43,6 @@ impl Connection {
             }
         }
         self.local_uni[kind as usize] = Some(stream);
-        self.send_queues_len = self.send_queues_len.saturating_add(queue.len());
         let send = SendState {
             queue,
             ..SendState::default()
@@ -113,12 +112,9 @@ impl Connection {
         encode_field_section(fields, &mut block);
         encode_header(HEADERS, block.len() as u64, &mut st.send.queue);
         st.send.queue.extend_from_slice(&block);
-        // The frame header is at most 16 bytes.
-        let n = block.len() + 16;
         if end {
             st.send.phase = SendPhase::Ending;
         }
-        self.send_queues_len = self.send_queues_len.saturating_add(n);
         self.finish_if_drained(s);
         Ok(())
     }
