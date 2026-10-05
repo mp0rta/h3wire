@@ -5,8 +5,8 @@
 //! bytes each stream received, writes out the bytes it asks to send, and executes the
 //! [`Action`]s it emits. The application learns what happened from [`Event`]s.
 //!
-//! v0.1 uses the QPACK static table only (it advertises a dynamic table capacity of 0 and
-//! 0 blocked streams) and never enables server push.
+//! v0.1 uses the QPACK static table only (it leaves the dynamic table capacity and blocked
+//! streams settings at their default of 0) and never enables server push.
 //!
 //! # Driving a connection
 //!
@@ -33,8 +33,8 @@
 //! - **Errors.** An `Err` from any call is a state notification only.
 //!   [`Action::CloseConnection`] is the sole trigger for the wire effects of a connection
 //!   error; after it (or [`Connection::transport_closed`]) keep draining
-//!   [`Connection::poll_event`] and [`Connection::poll_action`] — every other call returns
-//!   `Err(Closed(code))`.
+//!   [`Connection::poll_event`] and [`Connection::poll_action`] ([`Connection::peer_settings`]
+//!   also keeps working); every other call returns `Err(Closed(code))` or does nothing.
 //! - **Critical streams.** Read the peer's control and QPACK streams eagerly, regardless of
 //!   application demand; otherwise SETTINGS could stall behind a paused request stream.
 //!   QUIC flow-control credit is the adapter's job; the core only tracks what it consumed.
