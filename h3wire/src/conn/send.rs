@@ -68,3 +68,23 @@ impl Connection {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn local_settings_sent_after_settings_fully_written() {
+        let cfg = Config {
+            grease: false,
+            ..Config::default()
+        };
+        let mut c = Connection::new(Role::Client, cfg);
+        c.bind_uni(UniKind::Control, StreamId(2)).unwrap(); // [0x00, 0x04, 0x00]
+        c.sent(StreamId(2), 2).unwrap(); // stops inside SETTINGS
+        assert!(!c.local_settings_sent);
+        c.sent(StreamId(2), 1).unwrap();
+        assert!(c.local_settings_sent);
+    }
+}

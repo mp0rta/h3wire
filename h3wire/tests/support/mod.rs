@@ -78,6 +78,9 @@ pub struct Pair {
     dead: [bool; 2],
 }
 
+/// Generous cap on `drive` loop iterations; hitting it means the pair never settles.
+const MAX_DRIVE_ITERATIONS: usize = 1_000_000;
+
 fn idx(side: Side) -> usize {
     match side {
         Side::Client => 0,
@@ -147,7 +150,7 @@ impl Pair {
         for p in self.pipes.iter_mut().flat_map(|m| m.values_mut()) {
             p.paused = false;
         }
-        loop {
+        for _ in 0..MAX_DRIVE_ITERATIONS {
             let mut progress = false;
             for side in [Side::Client, Side::Server] {
                 progress |= self.flush(side);
@@ -157,9 +160,17 @@ impl Pair {
                 progress |= self.deliver(side);
             }
             if !progress {
-                break;
+                return;
             }
         }
+        panic!("drive: livelock, still progressing after {MAX_DRIVE_ITERATIONS} iterations");
+    }
+
+    /// A transport write by `from` on `s`; writing after FIN is a bug in the core.
+    fn transmit(&mut self, from: Side, s: StreamId, bytes: &[u8]) {
+        let p = self.pipes[idx(peer(from))].entry(s).or_default();
+        assert!(!p.fin, "{from:?} wrote on {s:?} after FinishStream");
+        p.buf.extend_from_slice(bytes);
     }
 
     /// `send_data` plus a scatter write of prefix and payload honoring `max_write`.
@@ -171,7 +182,7 @@ impl Pair {
         let all = [f.prefix(), payload].concat();
         let max = self.opts.max_write.unwrap_or(usize::MAX).max(1);
         for chunk in all.chunks(max) {
-            self.feed(peer(side), s, chunk, false);
+            self.transmit(side, s, chunk);
             self.conn(side).data_written(s, chunk.len()).unwrap();
         }
     }
@@ -205,7 +216,15 @@ impl Pair {
                     r.unwrap();
                 }
             }
-            Action::FinishStream(s) => self.feed(other, s, &[], true),
+            Action::FinishStream(s) => {
+                assert!(
+                    self.conn(side).poll_send(s).is_none(),
+                    "{side:?} FinishStream({s:?}) with core-owned bytes still queued"
+                );
+                let p = self.pipes[idx(other)].entry(s).or_default();
+                assert!(!p.fin, "{side:?} FinishStream({s:?}) twice");
+                p.fin = true;
+            }
             Action::ResetStream { stream, code } => {
                 let p = self.pipes[idx(other)].entry(stream).or_default();
                 p.buf.clear();
@@ -236,7 +255,7 @@ impl Pair {
                 continue;
             };
             let chunk = bytes[..bytes.len().min(max)].to_vec();
-            self.feed(peer(side), s, &chunk, false);
+            self.transmit(side, s, &chunk);
             self.conn(side).sent(s, chunk.len()).unwrap();
             progress = true;
         }
@@ -252,6 +271,9 @@ impl Pair {
         let ids: Vec<StreamId> = self.pipes[idx(side)].keys().copied().collect();
         let mut progress = false;
         for s in ids {
+            if self.dead[idx(side)] {
+                break;
+            }
             let p = &self.pipes[idx(side)][&s];
             if p.done || p.paused || (p.buf.is_empty() && !p.fin) {
                 continue;
@@ -271,6 +293,11 @@ impl Pair {
             }
             let n = consumed(&r);
             assert!(n > 0 || chunk.is_empty(), "recv made no progress on {s:?}");
+            assert!(
+                n <= chunk.len(),
+                "recv consumed {n} of {} on {s:?}",
+                chunk.len()
+            );
             p.buf.drain(..n);
             if fin && n == chunk.len() {
                 p.done = true;
@@ -308,7 +335,13 @@ pub fn feed_all(c: &mut Connection, s: StreamId, bytes: &[u8], fin: bool) {
     let mut rest = bytes;
     loop {
         let r = c.recv(s, rest, fin).unwrap();
+        assert!(r != Recv::Paused, "feed_all: recv paused on {s:?}");
         let n = consumed(&r);
+        assert!(
+            n <= rest.len(),
+            "recv consumed {n} of {} on {s:?}",
+            rest.len()
+        );
         assert!(n > 0 || rest.is_empty(), "recv made no progress on {s:?}");
         rest = &rest[n..];
         if rest.is_empty() {

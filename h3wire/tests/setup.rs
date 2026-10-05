@@ -81,3 +81,62 @@ fn pair_drive_binds_and_writes_uni_streams() {
     }
     assert!(p.closed.is_empty());
 }
+
+#[test]
+fn ready_helpers_bind_and_write_everything() {
+    for c in [
+        support::server_ready(Config::default()),
+        support::client_ready(Config::default()),
+        support::client_ready_with(Config::default(), &[(0x08, 1)]),
+    ] {
+        assert_eq!(c.sendable().count(), 0);
+    }
+}
+
+#[test]
+fn grease_control_stream_has_one_empty_grease_frame() {
+    let mut c = Connection::new(Role::Client, Config::default());
+    c.bind_uni(UniKind::Control, StreamId(2)).unwrap();
+    let b = c.poll_send(StreamId(2)).unwrap();
+    assert_eq!(b[0], 0x00);
+    let mut rest = &b[1..];
+    let mut frames = Vec::new();
+    while !rest.is_empty() {
+        let (ty, n) = h3wire::varint::decode(rest).unwrap();
+        rest = &rest[n..];
+        let (len, n) = h3wire::varint::decode(rest).unwrap();
+        rest = &rest[n + len as usize..];
+        frames.push((ty, len));
+    }
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].0, 0x04);
+    let (ty, len) = frames[1];
+    assert!(ty >= 0x21 && (ty - 0x21) % 0x1f == 0, "not GREASE: {ty:#x}");
+    assert_eq!(len, 0);
+}
+
+#[test]
+fn bind_uni_twice_is_wrong_phase() {
+    let mut c = Connection::new(Role::Server, Config::default());
+    c.bind_uni(UniKind::Control, StreamId(3)).unwrap();
+    assert_eq!(
+        c.bind_uni(UniKind::Control, StreamId(7)),
+        Err(UsageError::WrongPhase)
+    );
+    assert_eq!(
+        c.bind_uni(UniKind::QpackEncoder, StreamId(3)),
+        Err(UsageError::WrongPhase)
+    );
+}
+
+#[test]
+fn sent_rejects_overrun_and_unknown_stream() {
+    let mut c = Connection::new(Role::Client, Config::default());
+    c.bind_uni(UniKind::QpackEncoder, StreamId(6)).unwrap();
+    assert_eq!(c.sent(StreamId(6), 2), Err(UsageError::WrongPhase));
+    assert_eq!(c.sent(StreamId(6), 0), Ok(()));
+    assert_eq!(c.sent(StreamId(6), 1), Ok(()));
+    assert_eq!(c.poll_send(StreamId(6)), None);
+    assert_eq!(c.sent(StreamId(6), 1), Err(UsageError::WrongPhase));
+    assert_eq!(c.sent(StreamId(10), 0), Err(UsageError::UnknownStream));
+}
