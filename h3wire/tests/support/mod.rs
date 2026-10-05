@@ -1,7 +1,9 @@
 //! In-memory fake transport and wire-building helpers shared by integration tests.
 #![allow(dead_code)]
 
-use h3wire::{Action, Config, Connection, Event, H3Code, Recv, Role, StreamId};
+use h3wire::{
+    Action, Config, Connection, Event, H3Code, HeaderBlockId, HeadersKind, Recv, Role, StreamId,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub use h3wire::__invariants::{Obs, Side};
@@ -53,6 +55,68 @@ pub struct Opts {
     pub write_blocked: HashSet<(Side, StreamId)>,
 }
 
+/// A received field: name, value, never_index.
+pub type Field = (Vec<u8>, Vec<u8>, bool);
+
+/// An event with its header block resolved, so runs can be compared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seen {
+    Headers {
+        stream: StreamId,
+        kind: HeadersKind,
+        /// Pseudo-headers (in `:method :scheme :authority :path :protocol :status` order), then
+        /// regular fields in wire order.
+        fields: Vec<Field>,
+    },
+    Event(Event),
+}
+
+/// Resolve `block` into fields (empty once the connection closed).
+pub fn resolve(c: &Connection, block: HeaderBlockId) -> Vec<Field> {
+    let Ok(h) = c.headers(block) else {
+        return Vec::new();
+    };
+    let p = h.pseudo();
+    let status = p.status.map(|s| s.to_string().into_bytes());
+    let pseudo = [
+        (":method", p.method.map(<[u8]>::to_vec)),
+        (":scheme", p.scheme.map(<[u8]>::to_vec)),
+        (":authority", p.authority.map(<[u8]>::to_vec)),
+        (":path", p.path.map(<[u8]>::to_vec)),
+        (":protocol", p.protocol.map(<[u8]>::to_vec)),
+        (":status", status),
+    ];
+    let pseudo = pseudo
+        .into_iter()
+        .filter_map(|(n, v)| Some((n.as_bytes().to_vec(), v?, false)));
+    pseudo
+        .chain(
+            h.iter()
+                .map(|f| (f.name.to_vec(), f.value.to_vec(), f.never_index)),
+        )
+        .collect()
+}
+
+/// `e` as a `Seen`; a header block is resolved, then released (so `recv` never pauses on it).
+pub fn see(c: &mut Connection, e: Event) -> Seen {
+    match e {
+        Event::Headers {
+            stream,
+            block,
+            kind,
+        } => {
+            let fields = resolve(c, block);
+            c.release(block);
+            Seen::Headers {
+                stream,
+                kind,
+                fields,
+            }
+        }
+        e => Seen::Event(e),
+    }
+}
+
 /// One direction of one stream: bytes written but not yet consumed by the receiver.
 #[derive(Default)]
 struct Pipe {
@@ -72,6 +136,12 @@ pub struct Pair {
     pub trace: Vec<Obs>,
     pub closed: Vec<(Side, H3Code)>,
     pub bodies: HashMap<(Side, StreamId), Vec<u8>>,
+    /// Every byte written, keyed by writing side.
+    pub wire: HashMap<(Side, StreamId), Vec<u8>>,
+    /// Events resolved by `run_to_completion_resolving`, in trace order.
+    pub seen: Vec<(Side, Seen)>,
+    /// Trace entries already resolved into `seen`.
+    resolved: usize,
     /// Indexed by receiving side.
     pipes: [BTreeMap<StreamId, Pipe>; 2],
     next_uni: [u64; 2],
@@ -95,7 +165,7 @@ pub fn peer(side: Side) -> Side {
     }
 }
 
-fn consumed(r: &Recv) -> usize {
+pub fn consumed(r: &Recv) -> usize {
     match *r {
         Recv::Consumed(n)
         | Recv::Body { consumed: n, .. }
@@ -114,6 +184,9 @@ impl Pair {
             trace: Vec::new(),
             closed: Vec::new(),
             bodies: HashMap::new(),
+            wire: HashMap::new(),
+            seen: Vec::new(),
+            resolved: 0,
             pipes: [BTreeMap::new(), BTreeMap::new()],
             next_uni: [2, 3],
             dead: [false; 2],
@@ -138,6 +211,37 @@ impl Pair {
             .collect()
     }
 
+    /// Resolved events of one side, in order.
+    pub fn seen_by(&self, side: Side) -> Vec<Seen> {
+        self.seen
+            .iter()
+            .filter(|(s, _)| *s == side)
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
+    /// Drive until quiet, resolving and releasing every header block as it shows up.
+    pub fn run_to_completion_resolving(&mut self) {
+        loop {
+            self.drive();
+            if self.resolved == self.trace.len() {
+                return;
+            }
+            let new: Vec<(Side, Event)> = self.trace[self.resolved..]
+                .iter()
+                .filter_map(|o| match o {
+                    Obs::Event(s, e) => Some((*s, *e)),
+                    _ => None,
+                })
+                .collect();
+            self.resolved = self.trace.len();
+            for (side, e) in new {
+                let seen = see(self.conn(side), e);
+                self.seen.push((side, seen));
+            }
+        }
+    }
+
     /// Inject raw bytes into the pipe towards `to` on stream `s`.
     pub fn feed(&mut self, to: Side, s: StreamId, bytes: &[u8], fin: bool) {
         let p = self.pipes[idx(to)].entry(s).or_default();
@@ -160,6 +264,7 @@ impl Pair {
                 progress |= self.deliver(side);
             }
             if !progress {
+                h3wire::__invariants::check(&self.trace).unwrap();
                 return;
             }
         }
@@ -171,6 +276,10 @@ impl Pair {
         let p = self.pipes[idx(peer(from))].entry(s).or_default();
         assert!(!p.fin, "{from:?} wrote on {s:?} after FinishStream");
         p.buf.extend_from_slice(bytes);
+        self.wire
+            .entry((from, s))
+            .or_default()
+            .extend_from_slice(bytes);
     }
 
     /// `send_data` plus a scatter write of prefix and payload honoring `max_write`.
