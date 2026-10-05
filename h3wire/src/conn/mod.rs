@@ -1,0 +1,160 @@
+//! The HTTP/3 connection state machine.
+
+mod send;
+
+use crate::config::Config;
+use crate::error::{ConnectionError, H3Code, UsageError};
+use crate::event::{Action, DataFrame, Datagram, Event, Recv};
+use crate::headers::{BlockStore, FieldRef, HeaderBlockId, HeaderBlockRef};
+use crate::settings::PeerSettings;
+use crate::stream::{Stream, StreamId, UniKind};
+use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, VecDeque};
+use std::hash::BuildHasher;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Role {
+    Client,
+    Server,
+}
+
+pub struct Connection {
+    role: Role,
+    config: Config,
+    grease_seed: u64,
+    events: VecDeque<Event>,
+    actions: VecDeque<Action>,
+    streams: BTreeMap<StreamId, Stream>,
+    blocks: BlockStore,
+    peer_settings: Option<PeerSettings>,
+    /// Local uni streams, indexed by `UniKind as usize`.
+    local_uni: [Option<StreamId>; 3],
+    /// Bytes of the control stream (type + SETTINGS) not yet accepted by the transport.
+    settings_left: usize,
+    local_settings_sent: bool,
+}
+
+impl Connection {
+    pub fn new(role: Role, config: Config) -> Connection {
+        let actions = [
+            UniKind::Control,
+            UniKind::QpackEncoder,
+            UniKind::QpackDecoder,
+        ]
+        .map(Action::OpenUni);
+        Connection {
+            role,
+            config,
+            grease_seed: RandomState::new().hash_one(0u8),
+            events: VecDeque::new(),
+            actions: VecDeque::from(actions),
+            streams: BTreeMap::new(),
+            blocks: BlockStore::default(),
+            peer_settings: None,
+            local_uni: [None; 3],
+            settings_left: 0,
+            local_settings_sent: false,
+        }
+    }
+
+    pub fn poll_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+
+    pub fn poll_action(&mut self) -> Option<Action> {
+        self.actions.pop_front()
+    }
+
+    pub fn peer_settings(&self) -> Option<&PeerSettings> {
+        self.peer_settings.as_ref()
+    }
+
+    pub fn headers(&self, b: HeaderBlockId) -> Result<HeaderBlockRef<'_>, UsageError> {
+        self.blocks.get(b)
+    }
+
+    pub fn release(&mut self, b: HeaderBlockId) {
+        self.blocks.release(b);
+    }
+
+    // Stubs below: final signatures, bodies filled by later tasks.
+
+    pub fn recv(
+        &mut self,
+        _s: StreamId,
+        bytes: &[u8],
+        _fin: bool,
+    ) -> Result<Recv, ConnectionError> {
+        Ok(Recv::Consumed(bytes.len()))
+    }
+
+    pub fn send_headers(
+        &mut self,
+        _s: StreamId,
+        _fields: &[FieldRef],
+        _end: bool,
+    ) -> Result<(), UsageError> {
+        Err(UsageError::WrongPhase)
+    }
+
+    pub fn send_data(
+        &mut self,
+        _s: StreamId,
+        _payload_len: u64,
+        _end: bool,
+    ) -> Result<DataFrame, UsageError> {
+        Err(UsageError::WrongPhase)
+    }
+
+    pub fn data_written(&mut self, _s: StreamId, _n: usize) -> Result<(), UsageError> {
+        Err(UsageError::WrongPhase)
+    }
+
+    pub fn abort(&mut self, _s: StreamId, _code: H3Code) -> Result<(), UsageError> {
+        Err(UsageError::WrongPhase)
+    }
+
+    pub fn stream_reset_received(
+        &mut self,
+        _s: StreamId,
+        _code: H3Code,
+    ) -> Result<(), ConnectionError> {
+        Ok(())
+    }
+
+    pub fn stop_sending_received(
+        &mut self,
+        _s: StreamId,
+        _code: H3Code,
+    ) -> Result<(), ConnectionError> {
+        Ok(())
+    }
+
+    pub fn transport_closed(&mut self) {}
+
+    pub fn start_shutdown(&mut self) -> Result<(), UsageError> {
+        Err(UsageError::WrongPhase)
+    }
+
+    pub fn finish_shutdown(&mut self) -> Result<(), UsageError> {
+        Err(UsageError::WrongPhase)
+    }
+
+    pub fn datagram_prefix(&self, _s: StreamId, _buf: &mut [u8; 8]) -> Result<usize, UsageError> {
+        Err(UsageError::NotNegotiated)
+    }
+
+    pub fn parse_datagram(&mut self, _payload: &[u8]) -> Result<Datagram, ConnectionError> {
+        Ok(Datagram::Drop)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_buffered_bytes(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    pub fn debug_bound(&self) -> usize {
+        usize::MAX
+    }
+}

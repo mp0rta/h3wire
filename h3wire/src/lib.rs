@@ -14,3 +14,12 @@ mod config;
 mod settings;
 pub use config::*;
 pub use settings::PeerSettings;
+#[doc(hidden)]
+#[path = "invariants.rs"]
+pub mod __invariants;
+mod conn;
+mod event;
+mod stream;
+pub use conn::{Connection, Role};
+pub use event::{AbortSource, Action, DataFrame, Datagram, Event, Recv};
+pub use stream::{StreamId, UniKind};
