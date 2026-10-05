@@ -1,6 +1,7 @@
 //! The HTTP/3 connection state machine.
 
 mod abort;
+mod datagram;
 mod recv_req;
 mod recv_uni;
 mod send;
@@ -8,7 +9,7 @@ mod shutdown;
 
 use crate::config::Config;
 use crate::error::{ConnectionError, H3Code, UsageError};
-use crate::event::{Action, Datagram, Event, Recv};
+use crate::event::{Action, Event, Recv};
 use crate::headers::{BlockStore, HeaderBlockId, HeaderBlockRef};
 use crate::settings::PeerSettings;
 use crate::stream::{Stream, StreamId, UniKind};
@@ -142,18 +143,6 @@ impl Connection {
             ));
         }
         self.recv_req(s, bytes, fin)
-    }
-
-    // Stubs below: final signatures, bodies filled by later tasks.
-
-    pub fn datagram_prefix(&self, _s: StreamId, _buf: &mut [u8; 8]) -> Result<usize, UsageError> {
-        self.check_open().map_err(UsageError::Closed)?;
-        Err(UsageError::NotNegotiated)
-    }
-
-    pub fn parse_datagram(&mut self, _payload: &[u8]) -> Result<Datagram, ConnectionError> {
-        self.check_open().map_err(ConnectionError::Closed)?;
-        Ok(Datagram::Drop)
     }
 
     #[doc(hidden)]
