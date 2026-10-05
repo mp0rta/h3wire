@@ -16,6 +16,7 @@ use recv_uni::PeerUni;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::BuildHasher;
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -30,6 +31,8 @@ pub struct Connection {
     events: VecDeque<Event>,
     actions: VecDeque<Action>,
     streams: BTreeMap<StreamId, Stream>,
+    /// Reaped request stream ids: sorted, disjoint, adjacent ranges merged (ids step by 4).
+    closed_ids: Vec<Range<u64>>,
     blocks: BlockStore,
     /// Request stream of each delivered block, so `release` can lift that stream's pause.
     block_stream: HashMap<HeaderBlockId, StreamId>,
@@ -63,6 +66,7 @@ impl Connection {
             events: VecDeque::new(),
             actions: VecDeque::from(actions),
             streams: BTreeMap::new(),
+            closed_ids: Vec::new(),
             blocks: BlockStore::default(),
             block_stream: HashMap::new(),
             peer_settings: None,
@@ -133,11 +137,6 @@ impl Connection {
 
     // Stubs below: final signatures, bodies filled by later tasks.
 
-    pub fn abort(&mut self, _s: StreamId, _code: H3Code) -> Result<(), UsageError> {
-        self.check_open().map_err(UsageError::Closed)?;
-        Err(UsageError::WrongPhase)
-    }
-
     pub fn start_shutdown(&mut self) -> Result<(), UsageError> {
         self.check_open().map_err(UsageError::Closed)?;
         Err(UsageError::WrongPhase)
@@ -161,6 +160,19 @@ impl Connection {
     #[doc(hidden)]
     pub fn debug_buffered_bytes(&self) -> usize {
         0
+    }
+
+    /// Entries in the stream map: live request streams plus the bound local uni streams
+    /// (control, QPACK encoder/decoder). Peer uni stream state is kept apart.
+    #[doc(hidden)]
+    pub fn debug_stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Ranges in the reaped-id history.
+    #[doc(hidden)]
+    pub fn debug_closed_ranges(&self) -> usize {
+        self.closed_ids.len()
     }
 
     #[doc(hidden)]

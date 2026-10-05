@@ -90,7 +90,7 @@ impl Connection {
         end: bool,
     ) -> Result<(), UsageError> {
         self.check_open().map_err(UsageError::Closed)?;
-        if !s.is_request() {
+        if !s.is_request() || s.0 > varint::MAX || self.is_reaped(s) {
             return Err(UsageError::UnknownStream);
         }
         let role = self.role;
@@ -215,6 +215,7 @@ impl Connection {
         if st.send.phase == SendPhase::Ending && st.send.drained() {
             st.send.phase = SendPhase::Done;
             self.actions.push_back(Action::FinishStream(s));
+            self.reap(s);
         }
     }
 }

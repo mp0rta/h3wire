@@ -12,6 +12,7 @@ use crate::frame::{
 };
 use crate::headers::{HeadersKind, ValidateCtx, validate};
 use crate::stream::{RecvPhase, RecvState, StreamId, TunnelState};
+use crate::varint;
 
 /// Why a call ended without a normal result.
 enum Fail {
@@ -22,21 +23,22 @@ enum Fail {
 }
 
 impl Connection {
-    /// Server: the first sight of a client bidi id creates its stream. Client: a stream it
-    /// never opened is ignored (Task 13 decides reaped ids).
+    /// Server: the first sight of a client bidi id creates its stream, unless the id was
+    /// reaped or is beyond the varint range. Client: a stream it never opened (or one
+    /// already reaped) is ignored.
     pub(super) fn recv_req(
         &mut self,
         s: StreamId,
         bytes: &[u8],
         fin: bool,
     ) -> Result<Recv, ConnectionError> {
-        if self.role == Role::Server && s.is_request() {
+        if self.role == Role::Server && s.is_request() && s.0 <= varint::MAX && !self.is_reaped(s) {
             self.streams.entry(s).or_default();
         }
         if self.streams.get(&s).is_none_or(|st| st.recv.closed) {
             return Ok(Recv::Consumed(bytes.len()));
         }
-        match self.recv_frames(s, bytes, fin) {
+        let r = match self.recv_frames(s, bytes, fin) {
             Ok(r) => Ok(r),
             Err(Fail::Conn(code, reason)) => Err(self.close_with(code, reason)),
             Err(Fail::Stream(code)) => {
@@ -44,7 +46,9 @@ impl Connection {
                 Ok(Recv::Consumed(bytes.len()))
             }
             Err(Fail::Discard) => Ok(Recv::Consumed(bytes.len())),
-        }
+        };
+        self.reap(s);
+        r
     }
 
     /// One call returns at most one app-visible item; it stops right after a decoded
@@ -216,7 +220,9 @@ impl Connection {
                 Err(Fail::Stream(H3Code::MESSAGE_ERROR))
             }
             _ => {
-                self.events.push_back(Event::Finished(s));
+                if !std::mem::replace(&mut st.terminal_emitted, true) {
+                    self.events.push_back(Event::Finished(s));
+                }
                 Ok(())
             }
         }

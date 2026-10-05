@@ -35,6 +35,8 @@ pub enum UniKind {
 pub(crate) struct Stream {
     pub send: SendState,
     pub recv: RecvState,
+    /// `Finished` or `StreamAborted` was emitted (independent of directional closure).
+    pub terminal_emitted: bool,
 }
 
 /// Receive side of a request stream.

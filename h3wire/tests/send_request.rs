@@ -94,13 +94,22 @@ fn reused_stream_id_rejected() {
     c.send_headers(S0, &get(), true).unwrap();
     drain(&mut c, S0);
     assert_eq!(actions(&mut c), vec![Action::FinishStream(S0)]);
-    // Still tracked (reaping is Task 13): the phase rule answers.
+    // Still tracked (the response is outstanding): the phase rule answers.
     assert_eq!(
         c.send_headers(S0, &get(), true),
         Err(UsageError::WrongPhase)
     );
+    // The complete response reaps the stream; its id is never reused.
+    let resp = support::wire::headers(&[(":status", "200")]);
+    c.recv(S0, &resp, true).unwrap();
+    while c.poll_event().is_some() {}
+    assert_eq!(
+        c.send_headers(S0, &get(), true),
+        Err(UsageError::UnknownStream)
+    );
     // Not a client-initiated bidirectional id: our control stream, a server bidi, a uni.
-    for s in [2, 1, 3, 6] {
+    // Also ids beyond the varint range (1 << 62 and above are never stream ids).
+    for s in [2, 1, 3, 6, 1 << 62, u64::MAX - 3] {
         assert_eq!(
             c.send_headers(StreamId(s), &get(), true),
             Err(UsageError::UnknownStream),
