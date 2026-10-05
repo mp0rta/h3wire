@@ -7,8 +7,8 @@ mod shutdown;
 
 use crate::config::Config;
 use crate::error::{ConnectionError, H3Code, UsageError};
-use crate::event::{Action, DataFrame, Datagram, Event, Recv};
-use crate::headers::{BlockStore, FieldRef, HeaderBlockId, HeaderBlockRef};
+use crate::event::{Action, Datagram, Event, Recv};
+use crate::headers::{BlockStore, HeaderBlockId, HeaderBlockRef};
 use crate::settings::PeerSettings;
 use crate::stream::{Stream, StreamId, UniKind};
 use recv_uni::PeerUni;
@@ -120,31 +120,6 @@ impl Connection {
     }
 
     // Stubs below: final signatures, bodies filled by later tasks.
-
-    pub fn send_headers(
-        &mut self,
-        _s: StreamId,
-        _fields: &[FieldRef],
-        _end: bool,
-    ) -> Result<(), UsageError> {
-        self.check_open().map_err(UsageError::Closed)?;
-        Err(UsageError::WrongPhase)
-    }
-
-    pub fn send_data(
-        &mut self,
-        _s: StreamId,
-        _payload_len: u64,
-        _end: bool,
-    ) -> Result<DataFrame, UsageError> {
-        self.check_open().map_err(UsageError::Closed)?;
-        Err(UsageError::WrongPhase)
-    }
-
-    pub fn data_written(&mut self, _s: StreamId, _n: usize) -> Result<(), UsageError> {
-        self.check_open().map_err(UsageError::Closed)?;
-        Err(UsageError::WrongPhase)
-    }
 
     pub fn abort(&mut self, _s: StreamId, _code: H3Code) -> Result<(), UsageError> {
         self.check_open().map_err(UsageError::Closed)?;

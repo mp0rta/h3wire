@@ -31,6 +31,24 @@ pub enum UniKind {
 #[derive(Default)]
 pub(crate) struct Stream {
     pub send: SendState,
+    pub recv: RecvState,
+}
+
+/// Receive side of a request stream.
+#[derive(Default)]
+pub(crate) struct RecvState {
+    /// Client only: our request was HEAD, so the response carries no content.
+    pub expects_no_content: bool,
+    pub tunnel: TunnelState,
+}
+
+/// CONNECT tracking (spec §2.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TunnelState {
+    #[default]
+    Regular,
+    ConnectPending,
+    Tunnel,
 }
 
 /// Send side: core-owned bytes not yet accepted by the transport, plus the DATA frame in flight.
@@ -41,8 +59,10 @@ pub(crate) struct SendState {
     pub read: usize,
     pub phase: SendPhase,
     pub in_flight: Option<InFlight>,
-    pub fin_after_drain: bool,
-    pub finish_queued: bool,
+    /// Server: the request was HEAD (set on receive), so the response has no content.
+    pub request_is_head: bool,
+    /// Server: the final response status is 204 or 304.
+    pub no_content_status: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,7 +73,9 @@ pub(crate) enum SendPhase {
     Body,
     Tunnel,
     Trailers,
+    /// A call with `end = true` was accepted; FIN follows once drained.
     Ending,
+    /// `Action::FinishStream` queued.
     Done,
 }
 
@@ -71,6 +93,11 @@ impl SendState {
             return &[];
         }
         self.queue.get(self.read..).unwrap_or_default()
+    }
+
+    /// Nothing core-owned left to write: no queued bytes, no DATA in flight.
+    pub fn drained(&self) -> bool {
+        self.in_flight.is_none() && self.queue.is_empty()
     }
 
     /// Mark `n` pending bytes as written; the caller checked `n <= pending().len()`.

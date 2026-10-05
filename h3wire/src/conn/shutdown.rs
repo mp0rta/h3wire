@@ -8,4 +8,9 @@ impl Connection {
     pub(crate) fn on_goaway(&mut self, _id: u64) -> Result<(), H3Code> {
         Ok(())
     }
+
+    /// Whether a new request stream may be opened (false after a peer GOAWAY).
+    pub(crate) fn may_start_request(&self) -> bool {
+        true
+    }
 }
