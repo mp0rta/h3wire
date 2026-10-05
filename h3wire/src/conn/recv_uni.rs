@@ -38,6 +38,17 @@ pub(crate) struct ControlRecv {
     payload: Vec<u8>,
 }
 
+impl PeerUni {
+    /// Heap bytes held: a control frame payload or a partial decoder instruction.
+    pub(super) fn buffered_bytes(&self) -> usize {
+        match self {
+            PeerUni::Control(c) => c.payload.capacity(),
+            PeerUni::Decoder(p) => p.buffered_bytes(),
+            _ => 0,
+        }
+    }
+}
+
 /// Control frames whose payload is buffered and interpreted; all others are skipped.
 fn interpreted(ty: u64) -> bool {
     matches!(ty, SETTINGS | GOAWAY | MAX_PUSH_ID | CANCEL_PUSH)

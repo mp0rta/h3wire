@@ -56,6 +56,10 @@ pub struct Connection {
     goaway_received: Option<u64>,
     /// Server: the highest processed request id (see `mark_delivered`).
     highest_processed: Option<u64>,
+    /// Largest `closed_ids.len()` ever: merging ranges does not shrink the capacity.
+    peak_closed_ranges: usize,
+    /// Every byte the application had queued on any send queue (`debug_bound`).
+    send_queues_len: usize,
 }
 
 impl Connection {
@@ -87,6 +91,8 @@ impl Connection {
             goaway_sent: None,
             goaway_received: None,
             highest_processed: None,
+            peak_closed_ranges: 0,
+            send_queues_len: 0,
         }
     }
 
@@ -145,9 +151,19 @@ impl Connection {
         self.recv_req(s, bytes, fin)
     }
 
+    /// Heap bytes held by the connection's buffers: decoded header blocks, per-stream
+    /// HEADERS payloads and send queues, peer control/QPACK stream buffers and the
+    /// reaped-id ranges.
     #[doc(hidden)]
     pub fn debug_buffered_bytes(&self) -> usize {
-        0
+        let streams: usize = self
+            .streams
+            .values()
+            .map(|st| st.recv.headers_buf.capacity() + st.send.queue.capacity())
+            .sum();
+        let uni: usize = self.peer_uni.values().map(PeerUni::buffered_bytes).sum();
+        let closed = self.closed_ids.capacity() * size_of::<Range<u64>>();
+        self.blocks.buffered_bytes() + streams + uni + closed
     }
 
     /// Entries in the stream map: live request streams plus the bound local uni streams
@@ -163,8 +179,30 @@ impl Connection {
         self.closed_ids.len()
     }
 
+    /// Upper bound for `debug_buffered_bytes` (factors of 2 cover `Vec` capacity doubling).
+    ///
+    /// A decoded section of `E` encoded bytes needs at most `8/5 E` arena bytes (Huffman)
+    /// and `E` fields (one per encoded byte); a HEADERS payload is at most `E` and a
+    /// buffered control frame at most `C`; send queues hold only bytes the application
+    /// asked to send.
     #[doc(hidden)]
     pub fn debug_bound(&self) -> usize {
-        usize::MAX
+        let e = self.config.max_encoded_field_section_size;
+        let c = self.config.max_control_frame_size;
+        let field = size_of::<crate::qpack::decoder::DecodedField>();
+        let slot = e.saturating_mul(2).saturating_add(e.saturating_mul(field));
+        let range = size_of::<Range<u64>>();
+        [
+            self.blocks.slots().saturating_mul(slot.saturating_mul(2)),
+            self.streams
+                .len()
+                .saturating_mul(e.saturating_add(64).saturating_mul(2)),
+            c.saturating_mul(2),
+            self.send_queues_len.saturating_mul(2),
+            self.peak_closed_ranges.saturating_mul(2 * range),
+            1 << 20,
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
     }
 }

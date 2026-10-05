@@ -192,8 +192,14 @@ impl BlockStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn live_blocks(&self) -> usize {
         self.slots.iter().filter(|s| s.live).count()
+    }
+
+    /// Slots ever allocated, released ones included (their buffers are kept).
+    pub(crate) fn slots(&self) -> usize {
+        self.slots.len()
     }
 
     pub(crate) fn buffered_bytes(&self) -> usize {

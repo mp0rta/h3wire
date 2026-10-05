@@ -205,6 +205,7 @@ impl Connection {
         if over && s.is_request() {
             self.streams.remove(&s);
             insert_id(&mut self.closed_ids, s.0);
+            self.peak_closed_ranges = self.peak_closed_ranges.max(self.closed_ids.len());
         }
     }
 }

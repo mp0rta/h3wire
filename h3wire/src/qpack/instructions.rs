@@ -42,6 +42,11 @@ impl DecoderStreamParser {
         }
         Ok(buf.len())
     }
+
+    /// Heap bytes held for a partial instruction.
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.pending.capacity()
+    }
 }
 
 #[cfg(test)]
