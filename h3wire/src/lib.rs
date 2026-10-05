@@ -9,7 +9,7 @@ pub mod qpack;
 #[doc(hidden)]
 pub mod varint;
 pub use error::*;
-pub use headers::FieldRef;
+pub use headers::{FieldRef, HeaderBlockId, HeaderBlockRef, HeadersKind, Pseudo};
 mod config;
 mod settings;
 pub use config::*;
