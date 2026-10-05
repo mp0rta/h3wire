@@ -1,0 +1,4 @@
+[workspace]
+members = ["h3wire"]
+exclude = ["fuzz"]
+resolver = "3"
