@@ -352,6 +352,7 @@ fn check<'a>(
         ValidateCtx::Response => {
             fail(raw[..STATUS].iter().any(Option::is_some))?;
             let s = p.status.ok_or(())?;
+            // RFC 9110 §15: below 100 is invalid; 600..=999 is tolerated as extension space.
             fail(!(100..=999).contains(&s) || s == 101)?;
             out.kind = if s < 200 {
                 HeadersKind::Informational
@@ -368,7 +369,9 @@ fn check<'a>(
             fail(!is_token(method) || p.scheme.is_some_and(|s| !is_scheme(s)))?;
             out.is_connect = method == b"CONNECT";
             out.method_is_head = method == b"HEAD";
-            if p.protocol.is_some() {
+            if let Some(protocol) = p.protocol {
+                // RFC 8441 §4: :protocol carries an Upgrade token.
+                fail(!is_token(protocol))?;
                 // Extended CONNECT (RFC 9220 §3, RFC 8441 §4).
                 fail(!out.is_connect || !connect_protocol_enabled || p.authority.is_none())?;
                 out.is_extended_connect = true;
@@ -379,7 +382,8 @@ fn check<'a>(
             }
             let (scheme, path) = (p.scheme.ok_or(())?, p.path.ok_or(())?);
             fail(path.is_empty() || path.iter().any(|b| matches!(b, b' ' | b'\t')))?;
-            if scheme == b"http" || scheme == b"https" {
+            // RFC 3986 §3.1: schemes are case-insensitive.
+            if scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https") {
                 let options_star = path == b"*" && method == b"OPTIONS";
                 fail(!path.starts_with(b"/") && !options_star)?;
                 let authority = p.authority.or(host).ok_or(())?;
@@ -565,6 +569,11 @@ mod tests {
         bad(&ext_connect(b"", b"example.com"), REQ_EXT);
         bad(&ext_connect(b"relative", b"example.com"), REQ_EXT);
         bad(&ext_connect(b"/chat", b"user@example.com"), REQ_EXT);
+        for proto in [&b""[..], b"web socket"] {
+            let mut f = ext_connect(b"/chat", b"example.com");
+            f[1].1 = proto;
+            bad(&f, REQ_EXT);
+        }
         for missing in [b":scheme" as &[u8], b":path", b":authority"] {
             let f: Vec<F> = ext_connect(b"/chat", b"example.com")
                 .into_iter()
@@ -716,6 +725,10 @@ mod tests {
         bad(&get_req(b"*", &[]), REQ);
         bad(&get_req(b"", &[]), REQ);
         bad(&get_req(b"/a b", &[]), REQ);
+        // Scheme is case-insensitive: HTTPS gets the http/https rules.
+        let mut f = get_req(b"relative", &[]);
+        f[1].1 = b"HTTPS";
+        bad(&f, REQ);
         let mut f = get_req(b"*", &[]);
         f[0].1 = b"OPTIONS";
         ok(&f, REQ);
