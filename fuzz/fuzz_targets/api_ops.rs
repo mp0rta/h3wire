@@ -1,57 +1,8 @@
 #![no_main]
 
-use arbitrary::Arbitrary;
 use h3wire::{FieldRef, H3Code, Role, UniKind};
-use h3wire_fuzz::{IDS, Peer, id};
+use h3wire_fuzz::{IDS, Op, Peer, id};
 use libfuzzer_sys::fuzz_target;
-
-/// Peer input and application calls, interleaved.
-#[derive(Arbitrary, Debug)]
-enum Op {
-    Recv {
-        stream: u8,
-        bytes: Vec<u8>,
-        fin: bool,
-    },
-    Reset {
-        stream: u8,
-        code: u16,
-    },
-    StopSending {
-        stream: u8,
-        code: u16,
-    },
-    /// Empty `fields` sends a valid request (client) or a 200 response (server).
-    SendHeaders {
-        stream: u8,
-        fields: Vec<(Vec<u8>, Vec<u8>, bool)>,
-        end: bool,
-    },
-    SendData {
-        stream: u8,
-        len: u16,
-        end: bool,
-    },
-    Sent {
-        stream: u8,
-        n: u16,
-    },
-    DataWritten {
-        stream: u8,
-        n: u16,
-    },
-    /// Bind uni stream kind `x % 3` to id `IDS[x / 3]`.
-    OpenUni(u8),
-    /// Release the `n`-th header block delivered so far.
-    Release(u8),
-    Abort {
-        stream: u8,
-        code: u16,
-    },
-    StartShutdown,
-    FinishShutdown,
-    TransportClosed,
-}
 
 const MAX_OPS: usize = 4096;
 

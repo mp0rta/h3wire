@@ -1,5 +1,6 @@
 //! Shared driver for the connection-level fuzz targets (`wire`, `api_ops`).
 
+use arbitrary::Arbitrary;
 use h3wire::__invariants::{Obs, Side, check};
 use h3wire::{
     Config, Connection, Contexts, Datagram, Event, FrameExtension, H3Code, HeaderBlockId, Recv,
@@ -23,6 +24,73 @@ pub fn config() -> Config {
         .unwrap();
     c.register_uni_stream(0x54).unwrap();
     c
+}
+
+/// `api_ops` input: peer input and application calls, interleaved.
+#[derive(Arbitrary, Clone, Debug)]
+pub enum Op {
+    Recv {
+        stream: u8,
+        bytes: Vec<u8>,
+        fin: bool,
+    },
+    Reset {
+        stream: u8,
+        code: u16,
+    },
+    StopSending {
+        stream: u8,
+        code: u16,
+    },
+    /// Empty `fields` sends a valid request (client) or a 200 response (server).
+    SendHeaders {
+        stream: u8,
+        fields: Vec<(Vec<u8>, Vec<u8>, bool)>,
+        end: bool,
+    },
+    SendData {
+        stream: u8,
+        len: u16,
+        end: bool,
+    },
+    Sent {
+        stream: u8,
+        n: u16,
+    },
+    DataWritten {
+        stream: u8,
+        n: u16,
+    },
+    /// Bind uni stream kind `x % 3` to id `IDS[x / 3]`.
+    OpenUni(u8),
+    /// Release the `n`-th header block delivered so far.
+    Release(u8),
+    Abort {
+        stream: u8,
+        code: u16,
+    },
+    StartShutdown,
+    FinishShutdown,
+    TransportClosed,
+}
+
+/// `wire` input: peer input as the transport delivers it.
+#[derive(Arbitrary, Clone, Debug)]
+pub enum WireOp {
+    Recv {
+        stream: u8,
+        bytes: Vec<u8>,
+        fin: bool,
+    },
+    Reset {
+        stream: u8,
+        code: u16,
+    },
+    StopSending {
+        stream: u8,
+        code: u16,
+    },
+    Datagram(Vec<u8>),
 }
 
 /// One connection plus everything observed from it.

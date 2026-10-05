@@ -1,28 +1,8 @@
 #![no_main]
 
-use arbitrary::Arbitrary;
 use h3wire::{Action, Role, StreamId};
-use h3wire_fuzz::{Peer, id};
+use h3wire_fuzz::{Peer, WireOp, id};
 use libfuzzer_sys::fuzz_target;
-
-/// Peer input as the transport delivers it.
-#[derive(Arbitrary, Debug)]
-enum WireOp {
-    Recv {
-        stream: u8,
-        bytes: Vec<u8>,
-        fin: bool,
-    },
-    Reset {
-        stream: u8,
-        code: u16,
-    },
-    StopSending {
-        stream: u8,
-        code: u16,
-    },
-    Datagram(Vec<u8>),
-}
 
 /// A connection whose local uni streams are bound, as a transport would do at startup.
 fn peer(role: Role) -> Peer {
