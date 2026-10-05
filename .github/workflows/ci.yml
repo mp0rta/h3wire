@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo fmt --check --manifest-path fuzz/Cargo.toml
+
+  clippy:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+
+  msrv:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo build -p h3wire
+
+  deny:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame, qpack_decoder, wire, api_ops]
+    env:
+      # Pull requests and pushes: seed + corpus replay, then a 30 s smoke run. Weekly: 30 min.
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 1800 || 30 }}
+      # `api_ops` needs long inputs: thousands of ops (libFuzzer's default cap is 4096 bytes).
+      MAX_LEN: ${{ matrix.target == 'api_ops' && '-max_len=65536' || '' }}
+      # Committed seeds (regenerate: `cargo run --manifest-path fuzz/Cargo.toml --example
+      # gen_seeds`) plus the corpus grown by earlier runs, restored from the cache.
+      INPUTS: fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - run: mkdir -p fuzz/corpus/${{ matrix.target }}
+      - name: Replay seeds and corpus
+        run: cargo fuzz run ${{ matrix.target }} $INPUTS -- -runs=0 $MAX_LEN
+      - name: Fuzz
+        run: cargo fuzz run ${{ matrix.target }} $INPUTS -- -max_total_time=${{ env.FUZZ_SECONDS }} $MAX_LEN
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
