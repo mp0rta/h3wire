@@ -1,6 +1,7 @@
 //! Per-stream send path: uni stream binding, the core-owned byte queues, HEADERS,
 //! scatter/gather DATA, and the send phases ending in exactly one FIN.
 
+use super::shutdown::encode_goaway;
 use super::{Connection, Role};
 use crate::error::UsageError;
 use crate::event::{Action, DataFrame};
@@ -8,7 +9,9 @@ use crate::frame::{HEADERS, data_prefix, encode_header, grease_frame_type};
 use crate::headers::{FieldRef, HeadersKind, ValidateCtx, validate_outgoing};
 use crate::qpack::encoder::encode_field_section;
 use crate::settings::encode_local;
-use crate::stream::{InFlight, SendPhase, SendState, Stream, StreamId, TunnelState, UniKind};
+use crate::stream::{
+    InFlight, RecvPhase, SendPhase, SendState, Stream, StreamId, TunnelState, UniKind,
+};
 use crate::varint;
 
 impl Connection {
@@ -34,6 +37,9 @@ impl Connection {
             self.settings_left = queue.len();
             if self.config.grease {
                 encode_header(grease_frame_type(self.grease_seed), 0, &mut queue);
+            }
+            if let Some(id) = self.goaway_sent {
+                encode_goaway(id, &mut queue);
             }
         }
         self.local_uni[kind as usize] = Some(stream);
@@ -228,7 +234,10 @@ fn next_phase(
     end: bool,
 ) -> Result<SendPhase, UsageError> {
     match st.send.phase {
-        SendPhase::Idle | SendPhase::Headers if role == Role::Server => {
+        // A response only after the request HEADERS were delivered.
+        SendPhase::Idle | SendPhase::Headers
+            if role == Role::Server && st.recv.phase != RecvPhase::AwaitHeaders =>
+        {
             let m = validate_outgoing(fields, ValidateCtx::Response)?;
             if m.kind == HeadersKind::Informational {
                 return if end {
@@ -279,6 +288,7 @@ mod tests {
         let mut st = Stream::default();
         st.recv.tunnel = recv_tunnel;
         st.send.request_is_head = request_is_head;
+        st.recv.phase = RecvPhase::Body;
         c.streams.insert(StreamId(0), st);
         c
     }

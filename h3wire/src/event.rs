@@ -44,8 +44,20 @@ pub enum Event {
 
 impl Event {
     /// Whether the aborted request may be retried on a new connection.
+    /// Judged from provenance (spec section 4): at/above a GOAWAY cutoff, or the peer
+    /// sent `REQUEST_REJECTED`.
     pub fn retryable(&self) -> bool {
-        false
+        matches!(
+            self,
+            Event::StreamAborted {
+                source: AbortSource::GoAway,
+                ..
+            } | Event::StreamAborted {
+                source: AbortSource::Peer,
+                code: H3Code::REQUEST_REJECTED,
+                ..
+            }
+        )
     }
 }
 

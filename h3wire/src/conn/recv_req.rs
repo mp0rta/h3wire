@@ -118,11 +118,10 @@ impl Connection {
                     });
                 }
                 ty if delivered_ext(self.role, &self.config, &st.recv, ty) => {
-                    if self.role == Role::Server && !st.recv.delivered && !self.may_deliver(s) {
+                    if !self.may_deliver(s) {
                         return Err(Fail::Discard);
                     }
-                    let st = self.streams.get_mut(&s).ok_or(Fail::Discard)?;
-                    st.recv.delivered = true;
+                    self.mark_delivered(s);
                     break Some(Recv::Frame {
                         consumed: pos,
                         ty,
@@ -157,7 +156,7 @@ impl Connection {
             },
             _ => ValidateCtx::Response,
         };
-        if self.role == Role::Server && !st.recv.delivered && !self.may_deliver(s) {
+        if !self.may_deliver(s) {
             self.blocks.release(id);
             return Err(Fail::Discard);
         }
@@ -193,7 +192,7 @@ impl Connection {
             HeadersKind::Trailers => st.recv.phase = RecvPhase::AfterTrailers,
         }
         st.recv.unreleased = Some(id);
-        st.recv.delivered = true;
+        self.mark_delivered(s);
         self.block_stream.insert(id, s);
         self.events.push_back(Event::Headers {
             stream: s,

@@ -49,6 +49,12 @@ pub struct Connection {
     peer_critical: [bool; 3],
     /// Largest MAX_PUSH_ID received (server); push itself stays disabled.
     max_push_id: Option<u64>,
+    /// Id of the last GOAWAY we sent (never increases).
+    goaway_sent: Option<u64>,
+    /// Id of the last GOAWAY the peer sent.
+    goaway_received: Option<u64>,
+    /// Server: the highest processed request id (see `mark_delivered`).
+    highest_processed: Option<u64>,
 }
 
 impl Connection {
@@ -77,6 +83,9 @@ impl Connection {
             peer_uni: BTreeMap::new(),
             peer_critical: [false; 3],
             max_push_id: None,
+            goaway_sent: None,
+            goaway_received: None,
+            highest_processed: None,
         }
     }
 
@@ -136,16 +145,6 @@ impl Connection {
     }
 
     // Stubs below: final signatures, bodies filled by later tasks.
-
-    pub fn start_shutdown(&mut self) -> Result<(), UsageError> {
-        self.check_open().map_err(UsageError::Closed)?;
-        Err(UsageError::WrongPhase)
-    }
-
-    pub fn finish_shutdown(&mut self) -> Result<(), UsageError> {
-        self.check_open().map_err(UsageError::Closed)?;
-        Err(UsageError::WrongPhase)
-    }
 
     pub fn datagram_prefix(&self, _s: StreamId, _buf: &mut [u8; 8]) -> Result<usize, UsageError> {
         self.check_open().map_err(UsageError::Closed)?;
