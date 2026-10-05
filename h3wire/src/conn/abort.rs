@@ -3,8 +3,8 @@
 use super::Connection;
 use super::recv_uni::PeerUni;
 use crate::error::{ConnectionError, H3Code};
-use crate::event::{Action, Event};
-use crate::stream::StreamId;
+use crate::event::{AbortSource, Action, Event};
+use crate::stream::{SendPhase, SendState, StreamId};
 
 impl Connection {
     /// The single connection-error path: closes for good and queues the wire effect.
@@ -19,7 +19,52 @@ impl Connection {
         self.streams.clear();
         self.peer_uni.clear();
         self.blocks.clear();
+        self.block_stream.clear();
         ConnectionError::Closed(code)
+    }
+
+    /// A stream error detected locally (spec section 4).
+    pub(crate) fn stream_error(&mut self, s: StreamId, code: H3Code) {
+        self.abort_stream(s, code, code, AbortSource::Local);
+    }
+
+    /// The single per-stream abort path; minimal until Task 13 completes it.
+    ///
+    /// `ResetStream` if our send side is not `Done`; `StopSending` unless the receive side
+    /// is closed (a caller that saw the peer's FIN sets `recv.closed` first, and the event
+    /// is still emitted); queued send bytes are dropped; `Event::StreamAborted`.
+    pub(crate) fn abort_stream(
+        &mut self,
+        s: StreamId,
+        wire: H3Code,
+        event: H3Code,
+        source: AbortSource,
+    ) {
+        let Some(st) = self.streams.get_mut(&s) else {
+            return;
+        };
+        if st.send.phase != SendPhase::Done {
+            self.actions.push_back(Action::ResetStream {
+                stream: s,
+                code: wire,
+            });
+        }
+        if !st.recv.closed {
+            self.actions.push_back(Action::StopSending {
+                stream: s,
+                code: wire,
+            });
+        }
+        st.send = SendState {
+            phase: SendPhase::Done,
+            ..SendState::default()
+        };
+        st.recv.closed = true;
+        self.events.push_back(Event::StreamAborted {
+            stream: s,
+            code: event,
+            source,
+        });
     }
 
     /// `Err(code)` once the connection is closed; checked first by every public method.

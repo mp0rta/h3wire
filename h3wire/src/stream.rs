@@ -1,5 +1,8 @@
 //! Stream identifiers and per-stream state.
 
+use crate::frame::{FrameHeader, FrameHeaderParser};
+use crate::headers::HeaderBlockId;
+
 /// A QUIC stream id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub u64);
@@ -37,9 +40,33 @@ pub(crate) struct Stream {
 /// Receive side of a request stream.
 #[derive(Default)]
 pub(crate) struct RecvState {
-    /// Client only: our request was HEAD, so the response carries no content.
-    pub expects_no_content: bool,
+    pub parser: FrameHeaderParser,
+    /// The frame being read and its payload bytes still to come.
+    pub cur: Option<(FrameHeader, u64)>,
+    pub phase: RecvPhase,
+    /// Payload of the HEADERS frame being read; bounded at frame-header parse.
+    pub headers_buf: Vec<u8>,
+    /// The last delivered block until the application releases it (backpressure).
+    pub unreleased: Option<HeaderBlockId>,
+    /// From the request or final response (never from trailers).
+    pub content_length: Option<u64>,
+    pub data_received: u64,
     pub tunnel: TunnelState,
+    /// Client only: the response carries no content (request was HEAD, or status 204/304).
+    pub expects_no_content: bool,
+    /// Something reached the application (decoded HEADERS or an extension frame piece).
+    pub delivered: bool,
+    /// Receive side ended: `Finished`, FIN at a stream error, or aborted.
+    pub closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RecvPhase {
+    #[default]
+    AwaitHeaders,
+    AfterInformational,
+    Body,
+    AfterTrailers,
 }
 
 /// CONNECT tracking (spec §2.3).
@@ -84,6 +111,30 @@ pub(crate) struct InFlight {
     /// Prefix plus payload length.
     pub frame_len: u64,
     pub written: u64,
+}
+
+impl Stream {
+    /// A final response was sent (server) or received (client) (spec section 2.3): on a
+    /// CONNECT stream 2xx enters the tunnel, anything else returns to a regular message.
+    pub fn connect_final(&mut self, success: bool) {
+        if self.recv.tunnel != TunnelState::ConnectPending {
+            return;
+        }
+        if success {
+            self.enter_tunnel();
+        } else {
+            self.recv.tunnel = TunnelState::Regular;
+        }
+    }
+
+    /// Content-Length checks stop; a send side still in `Body` moves to `Tunnel`
+    /// (one already `Ending`/`Done` is left alone).
+    fn enter_tunnel(&mut self) {
+        self.recv.tunnel = TunnelState::Tunnel;
+        if self.send.phase == SendPhase::Body {
+            self.send.phase = SendPhase::Tunnel;
+        }
+    }
 }
 
 impl SendState {

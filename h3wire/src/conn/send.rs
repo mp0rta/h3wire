@@ -237,15 +237,9 @@ fn next_phase(
                 };
             }
             st.send.no_content_status = matches!(m.status, Some(204 | 304));
-            let success = m.status.is_some_and(|c| (200..300).contains(&c));
-            // Task 12 replaces this with `enter_tunnel` (both directions).
-            Ok(
-                if success && st.recv.tunnel == TunnelState::ConnectPending {
-                    SendPhase::Tunnel
-                } else {
-                    SendPhase::Body
-                },
-            )
+            st.send.phase = SendPhase::Body;
+            st.connect_final(m.status.is_some_and(|c| (200..300).contains(&c)));
+            Ok(st.send.phase)
         }
         SendPhase::Body if end => {
             validate_outgoing(fields, ValidateCtx::Trailers)?;
@@ -336,6 +330,7 @@ mod tests {
             c.send_headers(s, &status(b"100"), false).unwrap();
             c.send_headers(s, &status(code), false).unwrap();
             assert_eq!(c.streams[&s].send.phase, SendPhase::Tunnel);
+            assert_eq!(c.streams[&s].recv.tunnel, TunnelState::Tunnel);
             drain(&mut c);
             c.send_data(s, 5, false).unwrap();
             c.data_written(s, 7).unwrap();
@@ -347,6 +342,8 @@ mod tests {
         let mut c = server_with(TunnelState::ConnectPending, false);
         c.send_headers(s, &status(b"404"), false).unwrap();
         assert_eq!(c.streams[&s].send.phase, SendPhase::Body);
+        // The request body and trailers are a regular message again.
+        assert_eq!(c.streams[&s].recv.tunnel, TunnelState::Regular);
     }
 
     #[test]

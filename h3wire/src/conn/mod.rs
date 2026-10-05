@@ -1,6 +1,7 @@
 //! The HTTP/3 connection state machine.
 
 mod abort;
+mod recv_req;
 mod recv_uni;
 mod send;
 mod shutdown;
@@ -13,7 +14,7 @@ use crate::settings::PeerSettings;
 use crate::stream::{Stream, StreamId, UniKind};
 use recv_uni::PeerUni;
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::BuildHasher;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +31,8 @@ pub struct Connection {
     actions: VecDeque<Action>,
     streams: BTreeMap<StreamId, Stream>,
     blocks: BlockStore,
+    /// Request stream of each delivered block, so `release` can lift that stream's pause.
+    block_stream: HashMap<HeaderBlockId, StreamId>,
     peer_settings: Option<PeerSettings>,
     /// Local uni streams, indexed by `UniKind as usize`.
     local_uni: [Option<StreamId>; 3],
@@ -61,6 +64,7 @@ impl Connection {
             actions: VecDeque::from(actions),
             streams: BTreeMap::new(),
             blocks: BlockStore::default(),
+            block_stream: HashMap::new(),
             peer_settings: None,
             local_uni: [None; 3],
             settings_left: 0,
@@ -90,8 +94,17 @@ impl Connection {
     }
 
     pub fn release(&mut self, b: HeaderBlockId) {
-        if self.check_open().is_ok() {
-            self.blocks.release(b);
+        if self.check_open().is_err() {
+            return;
+        }
+        self.blocks.release(b);
+        // The stream may be gone or aborted already; that is fine.
+        if let Some(s) = self.block_stream.remove(&b) {
+            if let Some(st) = self.streams.get_mut(&s) {
+                if st.recv.unreleased == Some(b) {
+                    st.recv.unreleased = None;
+                }
+            }
         }
     }
 
@@ -115,8 +128,7 @@ impl Connection {
                 "server-initiated bidirectional stream",
             ));
         }
-        // Request streams: Task 12.
-        Ok(Recv::Consumed(bytes.len()))
+        self.recv_req(s, bytes, fin)
     }
 
     // Stubs below: final signatures, bodies filled by later tasks.
