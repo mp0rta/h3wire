@@ -4,6 +4,8 @@ mod error;
 #[doc(hidden)]
 pub mod frame;
 #[doc(hidden)]
+pub mod qpack;
+#[doc(hidden)]
 pub mod varint;
 pub use error::*;
 mod config;
