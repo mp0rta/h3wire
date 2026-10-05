@@ -1,6 +1,9 @@
 //! The HTTP/3 connection state machine.
 
+mod abort;
+mod recv_uni;
 mod send;
+mod shutdown;
 
 use crate::config::Config;
 use crate::error::{ConnectionError, H3Code, UsageError};
@@ -8,6 +11,7 @@ use crate::event::{Action, DataFrame, Datagram, Event, Recv};
 use crate::headers::{BlockStore, FieldRef, HeaderBlockId, HeaderBlockRef};
 use crate::settings::PeerSettings;
 use crate::stream::{Stream, StreamId, UniKind};
+use recv_uni::PeerUni;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::BuildHasher;
@@ -32,6 +36,13 @@ pub struct Connection {
     /// Bytes of the control stream (type + SETTINGS) not yet accepted by the transport.
     settings_left: usize,
     local_settings_sent: bool,
+    /// Set once by `close_with` (never recovers).
+    closed: Option<H3Code>,
+    peer_uni: BTreeMap<StreamId, PeerUni>,
+    /// Peer critical streams seen, indexed by `UniKind as usize`.
+    peer_critical: [bool; 3],
+    /// Largest MAX_PUSH_ID received (server); push itself stays disabled.
+    max_push_id: Option<u64>,
 }
 
 impl Connection {
@@ -54,6 +65,10 @@ impl Connection {
             local_uni: [None; 3],
             settings_left: 0,
             local_settings_sent: false,
+            closed: None,
+            peer_uni: BTreeMap::new(),
+            peer_critical: [false; 3],
+            max_push_id: None,
         }
     }
 
@@ -70,23 +85,41 @@ impl Connection {
     }
 
     pub fn headers(&self, b: HeaderBlockId) -> Result<HeaderBlockRef<'_>, UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         self.blocks.get(b)
     }
 
     pub fn release(&mut self, b: HeaderBlockId) {
-        self.blocks.release(b);
+        if self.check_open().is_ok() {
+            self.blocks.release(b);
+        }
+    }
+
+    /// Whether `s` is initiated by this endpoint.
+    fn is_local(&self, s: StreamId) -> bool {
+        s.is_client_initiated() == (self.role == Role::Client)
+    }
+
+    pub fn recv(&mut self, s: StreamId, bytes: &[u8], fin: bool) -> Result<Recv, ConnectionError> {
+        self.check_open().map_err(ConnectionError::Closed)?;
+        if s.is_uni() {
+            if self.is_local(s) {
+                // Our own send-only stream: caller misuse, ignored.
+                return Ok(Recv::Consumed(bytes.len()));
+            }
+            return self.recv_uni(s, bytes, fin);
+        }
+        if self.role == Role::Client && !s.is_client_initiated() {
+            return Err(self.close_with(
+                H3Code::STREAM_CREATION_ERROR,
+                "server-initiated bidirectional stream",
+            ));
+        }
+        // Request streams: Task 12.
+        Ok(Recv::Consumed(bytes.len()))
     }
 
     // Stubs below: final signatures, bodies filled by later tasks.
-
-    pub fn recv(
-        &mut self,
-        _s: StreamId,
-        bytes: &[u8],
-        _fin: bool,
-    ) -> Result<Recv, ConnectionError> {
-        Ok(Recv::Consumed(bytes.len()))
-    }
 
     pub fn send_headers(
         &mut self,
@@ -94,6 +127,7 @@ impl Connection {
         _fields: &[FieldRef],
         _end: bool,
     ) -> Result<(), UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         Err(UsageError::WrongPhase)
     }
 
@@ -103,48 +137,37 @@ impl Connection {
         _payload_len: u64,
         _end: bool,
     ) -> Result<DataFrame, UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         Err(UsageError::WrongPhase)
     }
 
     pub fn data_written(&mut self, _s: StreamId, _n: usize) -> Result<(), UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         Err(UsageError::WrongPhase)
     }
 
     pub fn abort(&mut self, _s: StreamId, _code: H3Code) -> Result<(), UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         Err(UsageError::WrongPhase)
     }
 
-    pub fn stream_reset_received(
-        &mut self,
-        _s: StreamId,
-        _code: H3Code,
-    ) -> Result<(), ConnectionError> {
-        Ok(())
-    }
-
-    pub fn stop_sending_received(
-        &mut self,
-        _s: StreamId,
-        _code: H3Code,
-    ) -> Result<(), ConnectionError> {
-        Ok(())
-    }
-
-    pub fn transport_closed(&mut self) {}
-
     pub fn start_shutdown(&mut self) -> Result<(), UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         Err(UsageError::WrongPhase)
     }
 
     pub fn finish_shutdown(&mut self) -> Result<(), UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         Err(UsageError::WrongPhase)
     }
 
     pub fn datagram_prefix(&self, _s: StreamId, _buf: &mut [u8; 8]) -> Result<usize, UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         Err(UsageError::NotNegotiated)
     }
 
     pub fn parse_datagram(&mut self, _payload: &[u8]) -> Result<Datagram, ConnectionError> {
+        self.check_open().map_err(ConnectionError::Closed)?;
         Ok(Datagram::Drop)
     }
 

@@ -4,7 +4,6 @@ use h3wire::{Action, Config, Connection, Event, Role, StreamId, UniKind, UsageEr
 use support::{Obs, Pair};
 
 #[test]
-#[ignore = "enabled in Task 10"]
 fn startup_actions_and_settings_exchange() {
     let mut p = Pair::new(Config::default(), Config::default());
     p.drive();

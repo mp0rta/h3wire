@@ -1,6 +1,6 @@
 //! Core-owned per-stream send path: uni stream binding and the byte queues.
 
-use super::{Connection, Role};
+use super::Connection;
 use crate::error::UsageError;
 use crate::frame::{encode_header, grease_frame_type};
 use crate::settings::encode_local;
@@ -11,8 +11,8 @@ impl Connection {
     /// Bind a stream opened for `Action::OpenUni(kind)`; queues its stream type
     /// (and, for the control stream, SETTINGS plus an optional GREASE frame).
     pub fn bind_uni(&mut self, kind: UniKind, stream: StreamId) -> Result<(), UsageError> {
-        let local = stream.is_client_initiated() == (self.role == Role::Client);
-        if !stream.is_uni() || !local {
+        self.check_open().map_err(UsageError::Closed)?;
+        if !stream.is_uni() || !self.is_local(stream) {
             return Err(UsageError::WrongStreamKind);
         }
         if self.local_uni[kind as usize].is_some() || self.streams.contains_key(&stream) {
@@ -43,19 +43,22 @@ impl Connection {
 
     /// Streams with core-owned bytes pending and no DATA in flight, ascending id.
     pub fn sendable(&self) -> impl Iterator<Item = StreamId> + '_ {
+        let open = self.check_open().is_ok();
         self.streams
             .iter()
-            .filter(|(_, st)| !st.send.pending().is_empty())
+            .filter(move |(_, st)| open && !st.send.pending().is_empty())
             .map(|(&id, _)| id)
     }
 
     pub fn poll_send(&self, s: StreamId) -> Option<&[u8]> {
+        self.check_open().ok()?;
         let p = self.streams.get(&s)?.send.pending();
         (!p.is_empty()).then_some(p)
     }
 
     /// The transport accepted the first `n` bytes of `poll_send(s)`.
     pub fn sent(&mut self, s: StreamId, n: usize) -> Result<(), UsageError> {
+        self.check_open().map_err(UsageError::Closed)?;
         let st = self.streams.get_mut(&s).ok_or(UsageError::UnknownStream)?;
         if n > st.send.pending().len() {
             return Err(UsageError::WrongPhase);
@@ -73,6 +76,7 @@ impl Connection {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::conn::Role;
 
     #[test]
     fn local_settings_sent_after_settings_fully_written() {
