@@ -45,10 +45,14 @@ impl Connection {
         self.closed.map_or(Ok(()), Err)
     }
 
-    /// Local cancellation of both directions of request stream `s` (spec section 4).
+    /// Local cancellation of both directions of request stream `s`: queues
+    /// `ResetStream` / `StopSending` with `code` for the directions still open and emits
+    /// [`Event::StreamAborted`] with source `Local`.
     ///
     /// Aborting a stream already reaped is a no-op (this also covers a stream the peer
-    /// reset, whatever the code).
+    /// reset, whatever the code). `Err(UnknownStream)` for a stream that is not a live
+    /// request stream; `Err(ForbiddenCode)` for `H3_REQUEST_REJECTED` from a client or on
+    /// a request the server already processed; `Err(OutOfRange)` beyond 2^62-1.
     pub fn abort(&mut self, s: StreamId, code: H3Code) -> Result<(), UsageError> {
         self.check_open().map_err(UsageError::Closed)?;
         if code.0 > varint::MAX {
@@ -128,6 +132,11 @@ impl Connection {
         }
     }
 
+    /// The peer reset its send side of stream `s` (QUIC RESET_STREAM).
+    ///
+    /// A request stream is aborted ([`Event::StreamAborted`] with source `Peer`, and our
+    /// own send side is reset too), even one never seen before. A critical stream closes
+    /// the connection (`H3_CLOSED_CRITICAL_STREAM`); other uni streams are forgotten.
     pub fn stream_reset_received(
         &mut self,
         s: StreamId,
@@ -160,8 +169,14 @@ impl Connection {
         Ok(())
     }
 
-    /// Peer STOP_SENDING ends only our send side (spec section 4); receiving goes on.
-    /// `SendStopped` is emitted once, while the send side was still open.
+    /// The peer asked us to stop sending on stream `s` (QUIC STOP_SENDING).
+    ///
+    /// On a request stream this ends only our send side: queued bytes are dropped, an
+    /// [`Action::ResetStream`] with the peer's code is queued (`H3_REQUEST_REJECTED`
+    /// becomes `H3_REQUEST_CANCELLED` where we may not send it) and
+    /// [`Event::SendStopped`] is emitted, once, while the send side was still open;
+    /// receiving goes on. On one of our critical streams it closes the connection
+    /// (`H3_CLOSED_CRITICAL_STREAM`).
     pub fn stop_sending_received(
         &mut self,
         s: StreamId,

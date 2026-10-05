@@ -13,13 +13,22 @@ pub const ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 pub const H3_DATAGRAM: u64 = 0x33;
 pub const H2_RESERVED_SETTINGS: [u64; 5] = [0x00, 0x02, 0x03, 0x04, 0x05];
 
+/// The peer's SETTINGS, from [`Connection::peer_settings`](crate::Connection::peer_settings).
+/// Absent settings have their RFC defaults.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerSettings {
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (unused: v0.1 never uses the dynamic table).
     pub qpack_max_table_capacity: u64,
+    /// `SETTINGS_QPACK_BLOCKED_STREAMS`.
     pub qpack_blocked_streams: u64,
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`, if sent. Advisory: the core does not check
+    /// outgoing sections against it.
     pub max_field_section_size: Option<u64>,
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`: Extended CONNECT requests may be sent.
     pub enable_connect_protocol: bool,
+    /// `SETTINGS_H3_DATAGRAM = 1`.
     pub h3_datagram: bool,
+    /// Every other setting except GREASE ones, `(id, value)` in wire order.
     pub unknown: Vec<(u64, u64)>,
 }
 

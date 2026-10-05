@@ -3,15 +3,20 @@
 use crate::frame::{FrameHeader, FrameHeaderParser};
 use crate::headers::HeaderBlockId;
 
-/// A QUIC stream id.
+/// A QUIC stream id (RFC 9000 section 2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StreamId(pub u64);
+pub struct StreamId(
+    /// The raw id.
+    pub u64,
+);
 
 impl StreamId {
+    /// Unidirectional.
     pub fn is_uni(self) -> bool {
         self.0 & 0x2 != 0
     }
 
+    /// Opened by the client.
     pub fn is_client_initiated(self) -> bool {
         self.0 & 0x1 == 0
     }
@@ -25,8 +30,11 @@ impl StreamId {
 /// The local unidirectional streams the core opens via `Action::OpenUni`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UniKind {
+    /// The control stream (type 0x00).
     Control,
+    /// The QPACK encoder stream (type 0x02).
     QpackEncoder,
+    /// The QPACK decoder stream (type 0x03).
     QpackDecoder,
 }
 

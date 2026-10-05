@@ -3,15 +3,22 @@
 use crate::error::{H3Code, UsageError};
 use crate::qpack::decoder::{DecodedField, Span, decode_field_section};
 
-/// A header field; `never_index` sets the QPACK 'N' bit.
+/// A header field, borrowed: what [`HeaderBlockRef::iter`] yields and what
+/// [`Connection::send_headers`](crate::Connection::send_headers) takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldRef<'a> {
+    /// The field name (lowercase on the wire); pseudo-headers start with `:`.
     pub name: &'a [u8],
+    /// The field value.
     pub value: &'a [u8],
+    /// The QPACK 'N' bit: on receive, set from the literal representation; on send, the
+    /// field is encoded as a literal with 'N' set. An intermediary passes it through
+    /// (RFC 9204 section 7.1.3).
     pub never_index: bool,
 }
 
 impl<'a> FieldRef<'a> {
+    /// A field with `never_index` off.
     pub fn new(name: &'a [u8], value: &'a [u8]) -> Self {
         Self {
             name,
@@ -21,28 +28,39 @@ impl<'a> FieldRef<'a> {
     }
 }
 
-/// Handle to a received header block; stale after `release`.
+/// Handle to a received header block (from [`Event::Headers`](crate::Event::Headers));
+/// stale after [`Connection::release`](crate::Connection::release) or connection close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HeaderBlockId {
     slot: u32,
     generation: u32,
 }
 
+/// Which part of a message a header block is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadersKind {
+    /// Request head (received by a server).
     Request,
+    /// Final (non-1xx) response head (received by a client).
     Response,
+    /// Interim 1xx response head (received by a client); a final response follows.
     Informational,
+    /// Trailer section, after the body (either role).
     Trailers,
 }
 
-/// Pseudo-header fields of a block (first occurrence of each).
+/// Pseudo-header fields of a block, validated before the block was delivered.
 #[derive(Debug, Default)]
 pub struct Pseudo<'a> {
+    /// `:method`.
     pub method: Option<&'a [u8]>,
+    /// `:scheme`.
     pub scheme: Option<&'a [u8]>,
+    /// `:authority`.
     pub authority: Option<&'a [u8]>,
+    /// `:path`.
     pub path: Option<&'a [u8]>,
+    /// `:protocol` (Extended CONNECT).
     pub protocol: Option<&'a [u8]>,
     /// Set only when `:status` is exactly three ASCII digits.
     pub status: Option<u16>,
@@ -82,7 +100,8 @@ fn parse_status(v: &[u8]) -> Option<u16> {
     }
 }
 
-/// A borrowed view of a received header block.
+/// A borrowed view of a received header block, from
+/// [`Connection::headers`](crate::Connection::headers).
 #[derive(Debug)]
 pub struct HeaderBlockRef<'a> {
     arena: &'a [u8],
@@ -96,6 +115,7 @@ impl<'a> HeaderBlockRef<'a> {
         self.all().filter(|f| !f.name.starts_with(b":"))
     }
 
+    /// The pseudo-header fields.
     pub fn pseudo(&self) -> &Pseudo<'a> {
         &self.pseudo
     }

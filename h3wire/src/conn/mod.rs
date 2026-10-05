@@ -19,12 +19,22 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::BuildHasher;
 use std::ops::Range;
 
+/// Which end of the QUIC connection this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
+    /// Opens request streams.
     Client,
+    /// Answers them.
     Server,
 }
 
+/// The HTTP/3 state of one QUIC connection. See the [crate docs](crate) for the driving
+/// loop and the caller contracts.
+///
+/// Once closed (a connection error, which queues [`Action::CloseConnection`], or
+/// [`Connection::transport_closed`]) it never recovers: [`Connection::poll_event`],
+/// [`Connection::poll_action`] and [`Connection::peer_settings`] keep working so the caller
+/// can drain them, and every other call returns `Err(Closed(code))` (or nothing).
 pub struct Connection {
     role: Role,
     config: Config,
@@ -61,6 +71,8 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// A new connection. Queues [`Action::OpenUni`] for the control and QPACK
+    /// encoder/decoder streams; SETTINGS go out once the control stream is bound.
     pub fn new(role: Role, config: Config) -> Connection {
         let actions = [
             UniKind::Control,
@@ -93,23 +105,34 @@ impl Connection {
         }
     }
 
+    /// The next event for the application, in order.
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
     }
 
+    /// The next action for the transport, in order. Execute each one; after a connection
+    /// error, the queued [`Action::CloseConnection`] is the only thing that closes the QUIC
+    /// connection.
     pub fn poll_action(&mut self) -> Option<Action> {
         self.actions.pop_front()
     }
 
+    /// The peer's SETTINGS, once [`Event::PeerSettings`] was emitted.
     pub fn peer_settings(&self) -> Option<&PeerSettings> {
         self.peer_settings.as_ref()
     }
 
+    /// Read a delivered header block. It stays readable after its stream finished or was
+    /// aborted, until [`Connection::release`]. `Err(StaleBlock)` once released;
+    /// `Err(Closed)` once the connection is closed (every block is freed then).
     pub fn headers(&self, b: HeaderBlockId) -> Result<HeaderBlockRef<'_>, UsageError> {
         self.check_open().map_err(UsageError::Closed)?;
         self.blocks.get(b)
     }
 
+    /// Free a header block. A stream holds at most one unreleased block: its next HEADERS
+    /// is not decoded until then ([`Recv::Paused`]); feed the stream again after this.
+    /// Releasing a stale block is a no-op.
     pub fn release(&mut self, b: HeaderBlockId) {
         if self.check_open().is_err() {
             return;
@@ -130,6 +153,26 @@ impl Connection {
         s.is_client_initiated() == (self.role == Role::Client)
     }
 
+    /// Feed bytes received on stream `s` (`fin`: the peer's FIN follows them).
+    ///
+    /// Progress contract:
+    /// - Each call consumes a prefix of `bytes` (the `consumed` count of the result); the
+    ///   caller re-feeds the rest on a later call.
+    /// - `fin` counts only on a call that consumes all of `bytes`; an empty `bytes` with
+    ///   `fin = true` is valid (a bare FIN).
+    /// - `Consumed(0)` is returned only for empty `bytes`; every other result makes
+    ///   progress, except [`Recv::Paused`]: then stop feeding this stream until the
+    ///   [`release`](Connection::release) of its unreleased block, and feed the same bytes
+    ///   again.
+    /// - A call returns at most one application-visible item: it stops right after a
+    ///   decoded HEADERS block, so the [`Event::Headers`] comes before what follows.
+    ///
+    /// Peer control and QPACK streams (and registered uni stream types) always consume
+    /// everything; read them eagerly, independently of application demand. Bytes on a
+    /// stream that was aborted or finished are consumed and discarded.
+    ///
+    /// `Err` means the connection is closed (by this call, which then queued
+    /// [`Action::CloseConnection`], or earlier).
     pub fn recv(&mut self, s: StreamId, bytes: &[u8], fin: bool) -> Result<Recv, ConnectionError> {
         self.check_open().map_err(ConnectionError::Closed)?;
         if s.is_uni() {

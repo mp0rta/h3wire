@@ -17,6 +17,9 @@ use crate::varint;
 impl Connection {
     /// Bind a stream opened for `Action::OpenUni(kind)`; queues its stream type
     /// (and, for the control stream, SETTINGS plus an optional GREASE frame).
+    ///
+    /// `Err(WrongStreamKind)` unless `stream` is a uni stream opened by this endpoint;
+    /// `Err(WrongPhase)` if `kind` is already bound or `stream` is in use.
     pub fn bind_uni(&mut self, kind: UniKind, stream: StreamId) -> Result<(), UsageError> {
         self.check_open().map_err(UsageError::Closed)?;
         if !stream.is_uni() || !self.is_local(stream) {
@@ -57,7 +60,13 @@ impl Connection {
         Ok(())
     }
 
-    /// Streams with core-owned bytes pending and no DATA in flight, ascending id.
+    /// Streams with core-owned bytes pending (HEADERS, control and QPACK stream bytes) and
+    /// no DATA frame in flight, ascending id.
+    ///
+    /// Collect the ids before writing (`sent` changes the set), then write each stream
+    /// with [`poll_send`](Connection::poll_send) / [`sent`](Connection::sent) until the
+    /// transport accepts less than offered: one stream blocked by flow control never
+    /// stalls the others.
     pub fn sendable(&self) -> impl Iterator<Item = StreamId> + '_ {
         let open = self.check_open().is_ok();
         self.streams
@@ -66,13 +75,19 @@ impl Connection {
             .map(|(&id, _)| id)
     }
 
+    /// The core-owned bytes stream `s` has to write now, if any. Report what the
+    /// transport accepted with [`sent`](Connection::sent).
     pub fn poll_send(&self, s: StreamId) -> Option<&[u8]> {
         self.check_open().ok()?;
         let p = self.streams.get(&s)?.send.pending();
         (!p.is_empty()).then_some(p)
     }
 
-    /// The transport accepted the first `n` bytes of `poll_send(s)`.
+    /// The transport accepted the first `n` bytes of `poll_send(s)`. May queue
+    /// [`Action::FinishStream`].
+    ///
+    /// `Err(UnknownStream)` for a stream with no send state; `Err(WrongPhase)` if `n`
+    /// exceeds what `poll_send(s)` returned.
     pub fn sent(&mut self, s: StreamId, n: usize) -> Result<(), UsageError> {
         self.check_open().map_err(UsageError::Closed)?;
         let st = self.streams.get_mut(&s).ok_or(UsageError::UnknownStream)?;
@@ -89,6 +104,21 @@ impl Connection {
     }
 
     /// Queue a HEADERS frame: a new request (client), a response (server), or trailers.
+    ///
+    /// - Client: on an unused client-initiated bidirectional id this starts a request;
+    ///   after the body it sends trailers.
+    /// - Server: a response only after the request's `Headers` was delivered; any number
+    ///   of 1xx (`end = false`) may precede the final response; after the body, trailers.
+    /// - Trailers require `end = true`. In a tunnel (after a 2xx to CONNECT) no HEADERS
+    ///   may be sent.
+    /// - `end = true`: nothing follows; FIN is requested by [`Action::FinishStream`] once
+    ///   everything queued is written.
+    ///
+    /// The fields are validated like received ones: `Err(InvalidField)` if they do not
+    /// form a valid request, response or trailer section. Also `Err(UnknownStream)`,
+    /// `Err(WrongPhase)`, `Err(GoingAway)` (client, after the peer's GOAWAY) and
+    /// `Err(NotNegotiated)` (`:protocol` without the peer's
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`).
     pub fn send_headers(
         &mut self,
         s: StreamId,
@@ -120,6 +150,17 @@ impl Connection {
     }
 
     /// Start a DATA frame of `payload_len` bytes; the caller writes `prefix()` then the payload.
+    ///
+    /// The payload never passes through the core: write
+    /// `writev([frame.prefix(), payload])` and report every accepted byte (prefix
+    /// included) with [`data_written`](Connection::data_written); keep the payload until
+    /// it is fully written. `payload_len = 0` with `end = true` is FIN only: the prefix is
+    /// empty and nothing is written.
+    ///
+    /// Allowed after the request (client) or a final response (server), and in a tunnel;
+    /// a response to HEAD, 204 or 304 takes only `payload_len = 0`. `Err(Blocked)`
+    /// (retryable) while HEADERS bytes are queued or a DATA frame is in flight;
+    /// `Err(WrongPhase)` otherwise misplaced; `Err(OutOfRange)` beyond 2^62-1.
     pub fn send_data(
         &mut self,
         s: StreamId,
@@ -165,7 +206,9 @@ impl Connection {
         Ok(frame)
     }
 
-    /// The transport accepted `n` more bytes of the in-flight DATA frame (prefix, then payload).
+    /// The transport accepted `n` more bytes of the in-flight DATA frame (prefix, then
+    /// payload). May queue [`Action::FinishStream`]. `Err(WrongPhase)` with no frame in
+    /// flight or past its end.
     pub fn data_written(&mut self, s: StreamId, n: usize) -> Result<(), UsageError> {
         self.check_open().map_err(UsageError::Closed)?;
         let st = &mut self
