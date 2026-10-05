@@ -130,7 +130,8 @@ pub enum UsageError {
     NotNegotiated,
     /// Client: the peer sent GOAWAY, so no new request may start.
     GoingAway,
-    /// The header block was released, or the id is not from this connection.
+    /// The header block was already released. Ids are only
+    /// meaningful on the connection that issued them.
     StaleBlock,
     /// The fields to send do not form a valid HTTP/3 message head or trailer section.
     InvalidField,
