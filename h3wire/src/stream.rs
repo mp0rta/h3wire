@@ -153,6 +153,14 @@ impl SendState {
         self.in_flight.is_none() && self.queue.is_empty()
     }
 
+    /// Sending is over (reset or stopped): queued bytes and in-flight DATA are dropped.
+    pub fn stop(&mut self) {
+        *self = SendState {
+            phase: SendPhase::Done,
+            ..SendState::default()
+        };
+    }
+
     /// Mark `n` pending bytes as written; the caller checked `n <= pending().len()`.
     pub fn advance(&mut self, n: usize) {
         self.read += n;

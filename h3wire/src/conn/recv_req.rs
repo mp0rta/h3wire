@@ -23,18 +23,23 @@ enum Fail {
 }
 
 impl Connection {
-    /// Server: the first sight of a client bidi id creates its stream, unless the id was
-    /// reaped or is beyond the varint range. Client: a stream it never opened (or one
-    /// already reaped) is ignored.
+    /// Server: the first sight of a client bidi id (bytes, RESET_STREAM or STOP_SENDING)
+    /// creates its stream, unless the id was reaped or is beyond the varint range.
+    pub(super) fn first_sight(&mut self, s: StreamId) {
+        if self.role == Role::Server && s.is_request() && s.0 <= varint::MAX && !self.is_reaped(s) {
+            self.streams.entry(s).or_default();
+        }
+    }
+
+    /// Server: see `first_sight`. Client: a stream it never opened (or one already
+    /// reaped) is ignored.
     pub(super) fn recv_req(
         &mut self,
         s: StreamId,
         bytes: &[u8],
         fin: bool,
     ) -> Result<Recv, ConnectionError> {
-        if self.role == Role::Server && s.is_request() && s.0 <= varint::MAX && !self.is_reaped(s) {
-            self.streams.entry(s).or_default();
-        }
+        self.first_sight(s);
         if self.streams.get(&s).is_none_or(|st| st.recv.closed) {
             return Ok(Recv::Consumed(bytes.len()));
         }

@@ -5,7 +5,7 @@ use super::recv_uni::PeerUni;
 use super::{Connection, Role};
 use crate::error::{ConnectionError, H3Code, UsageError};
 use crate::event::{AbortSource, Action, Event};
-use crate::stream::{SendPhase, SendState, StreamId};
+use crate::stream::{SendPhase, StreamId};
 use crate::varint;
 use std::ops::Range;
 
@@ -104,10 +104,7 @@ impl Connection {
                 code: wire,
             });
         }
-        st.send = SendState {
-            phase: SendPhase::Done,
-            ..SendState::default()
-        };
+        st.send.stop();
         st.recv.closed = true;
         if !std::mem::replace(&mut st.terminal_emitted, true) {
             self.events.push_back(Event::StreamAborted {
@@ -152,15 +149,13 @@ impl Connection {
         if !s.is_request() || s.0 > varint::MAX {
             return Ok(());
         }
+        // A reset before any byte arrived still opened the stream: our half gets reset too.
+        self.first_sight(s);
         if let Some(st) = self.streams.get_mut(&s) {
             // The reset direction is over: no STOP_SENDING for it.
             st.recv.closed = true;
             let wire = self.local_wire_code(s, code);
             self.abort_stream(s, wire, code, AbortSource::Peer);
-        } else if self.role == Role::Server {
-            // Reset before any byte arrived: record the id so it is never created later
-            // and the closed history stays merged.
-            insert_id(&mut self.closed_ids, s.0);
         }
         Ok(())
     }
@@ -176,6 +171,7 @@ impl Connection {
         if self.local_uni.contains(&Some(s)) {
             return Err(self.close_with(H3Code::CLOSED_CRITICAL_STREAM, "critical stream stopped"));
         }
+        self.first_sight(s);
         let wire = self.local_wire_code(s, code);
         let Some(st) = self.streams.get_mut(&s) else {
             return Ok(());
@@ -183,10 +179,7 @@ impl Connection {
         if st.send.phase == SendPhase::Done {
             return Ok(());
         }
-        st.send = SendState {
-            phase: SendPhase::Done,
-            ..SendState::default()
-        };
+        st.send.stop();
         self.actions.push_back(Action::ResetStream {
             stream: s,
             code: wire,

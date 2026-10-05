@@ -687,3 +687,85 @@ fn huge_ids_are_never_streams() {
         }
     }
 }
+
+#[test]
+fn server_reset_before_first_byte_resets_our_half() {
+    let mut c = server_ready(Config::default());
+    c.stream_reset_received(S0, H3Code::REQUEST_CANCELLED)
+        .unwrap();
+    // The RESET_STREAM opened the bidi stream: our half is reset so its credit returns.
+    assert_eq!(
+        actions(&mut c),
+        [Action::ResetStream {
+            stream: S0,
+            code: H3Code::REQUEST_CANCELLED
+        }]
+    );
+    assert_eq!(
+        events(&mut c),
+        [aborted(S0, H3Code::REQUEST_CANCELLED, AbortSource::Peer)]
+    );
+    let w = get_wire();
+    assert_eq!(c.recv(S0, &w, true), Ok(Recv::Consumed(w.len())));
+    assert_eq!(events(&mut c), []);
+    assert_eq!(c.debug_stream_count(), CRITICAL);
+}
+
+#[test]
+fn server_stop_sending_before_request_still_receives() {
+    let mut c = server_ready(Config::default());
+    c.stop_sending_received(S0, H3Code::REQUEST_CANCELLED)
+        .unwrap();
+    assert_eq!(
+        actions(&mut c),
+        [Action::ResetStream {
+            stream: S0,
+            code: H3Code::REQUEST_CANCELLED
+        }]
+    );
+    assert_eq!(
+        events(&mut c),
+        [Event::SendStopped {
+            stream: S0,
+            code: H3Code::REQUEST_CANCELLED
+        }]
+    );
+    c.stop_sending_received(S0, H3Code::REQUEST_CANCELLED)
+        .unwrap();
+    assert_eq!(events(&mut c), []);
+    let (evs, _) = run(&mut c, S0, &get_wire(), true);
+    assert!(
+        matches!(
+            evs[..],
+            [
+                Event::Headers {
+                    kind: HeadersKind::Request,
+                    ..
+                },
+                Event::Finished(S0)
+            ]
+        ),
+        "{evs:?}"
+    );
+    assert_eq!(actions(&mut c), []);
+    assert_eq!(c.debug_stream_count(), CRITICAL, "reaped");
+}
+
+#[test]
+fn peer_reset_after_finished_resets_response_only() {
+    let (mut c, evs) = server_got(&get_wire(), true);
+    assert_eq!(evs.last(), Some(&Event::Finished(S0)));
+    c.send_headers(S0, &[f(":status", "200")], false).unwrap();
+    drain(&mut c, S0);
+    c.stream_reset_received(S0, H3Code::REQUEST_CANCELLED)
+        .unwrap();
+    assert_eq!(
+        actions(&mut c),
+        [Action::ResetStream {
+            stream: S0,
+            code: H3Code::REQUEST_CANCELLED
+        }]
+    );
+    assert_eq!(events(&mut c), []);
+    assert_eq!(c.debug_stream_count(), CRITICAL);
+}

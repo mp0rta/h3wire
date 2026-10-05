@@ -42,7 +42,7 @@ pub struct Connection {
     /// Bytes of the control stream (type + SETTINGS) not yet accepted by the transport.
     settings_left: usize,
     local_settings_sent: bool,
-    /// Set once by `close_with` (never recovers).
+    /// Set once by `close_with` or `transport_closed` (never recovers).
     closed: Option<H3Code>,
     peer_uni: BTreeMap<StreamId, PeerUni>,
     /// Peer critical streams seen, indexed by `UniKind as usize`.
