@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo fmt --check --manifest-path fuzz/Cargo.toml
+
+  clippy:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+
+  msrv:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo build -p h3wire
+
+  deny:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame, qpack_decoder, wire, api_ops]
+    env:
+      # Pull requests and pushes: corpus replay + 30 s smoke. Weekly: 30 min.
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 1800 || 30 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: mkdir -p fuzz/corpus/${{ matrix.target }}
+      - name: Replay corpus
+        run: cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} -- -runs=0
+      - name: Fuzz
+        run: cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_SECONDS }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
