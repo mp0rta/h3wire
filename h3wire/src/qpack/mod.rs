@@ -1,7 +1,9 @@
 //! QPACK (RFC 9204) building blocks.
 
+pub mod decoder;
 pub mod encoder;
 pub mod huffman;
+pub mod instructions;
 pub mod prefix_int;
 pub mod static_table;
 
