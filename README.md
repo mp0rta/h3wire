@@ -6,7 +6,7 @@ The core (HTTP/3, RFC 9114, and QPACK, RFC 9204) consumes stream bytes and reset
 from your QUIC transport and returns events for the application and actions for
 the transport, with no I/O, no async runtime and no dependencies beyond `std`
 (`#![forbid(unsafe_code)]`, MSRV 1.85).
-Status: v0.1 in development. It covers RFC 9114 request/response streams, control
+Status: v0.1 core. It covers RFC 9114 request/response streams, control
 and QPACK streams, GOAWAY and stream termination, QPACK with the static table only
 (no dynamic table), Extended CONNECT (RFC 9220), the HTTP/3 part of HTTP Datagrams
 (RFC 9297) and extension points for frame, stream and setting types. There is no
@@ -14,14 +14,13 @@ async layer or QUIC adapter yet.
 
 ## Installation
 
-The first crates.io release is being prepared. For now, add the library from Git:
+Add the library with Cargo:
 
 ```sh
-cargo add h3wire --git https://github.com/mp0rta/h3wire
+cargo add h3wire
 ```
 
-Once v0.1.0 is published, use `cargo add h3wire` or add
-`h3wire = "0.1"` under `[dependencies]` in your `Cargo.toml`.
+Or add `h3wire = "0.1"` under `[dependencies]`.
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.
