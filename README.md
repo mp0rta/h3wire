@@ -12,5 +12,16 @@ and QPACK streams, GOAWAY and stream termination, QPACK with the static table on
 (RFC 9297) and extension points for frame, stream and setting types. There is no
 async layer or QUIC adapter yet.
 
+## Installation
+
+The first crates.io release is being prepared. For now, add the library from Git:
+
+```sh
+cargo add h3wire --git https://github.com/mp0rta/h3wire
+```
+
+Once v0.1.0 is published, use `cargo add h3wire` or add
+`h3wire = "0.1"` under `[dependencies]` in your `Cargo.toml`.
+
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.

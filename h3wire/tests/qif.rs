@@ -8,7 +8,7 @@ use std::path::PathBuf;
 type Block = Vec<(Vec<u8>, Vec<u8>)>;
 
 fn data() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdata/qifs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/qifs")
 }
 
 /// QIF: `name\tvalue` lines, blocks separated by blank lines, `#` comments.

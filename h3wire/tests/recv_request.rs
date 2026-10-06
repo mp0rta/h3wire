@@ -879,6 +879,53 @@ fn server_rejects_trailers_in_tunnel() {
 }
 
 #[test]
+fn forwarding_all_fields_preserves_pseudo_header_never_index() {
+    let mut fields = req("GET");
+    fields[3].never_index = true; // :path / has a full static-table match.
+    fields.extend([
+        f("x-order", "first"),
+        FieldRef {
+            never_index: true,
+            ..f("authorization", "secret")
+        },
+        f("x-order", "last"),
+    ]);
+
+    let mut downstream = pair();
+    downstream.client.send_headers(S0, &fields, true).unwrap();
+    downstream.drive();
+    let block = downstream
+        .events(Side::Server)
+        .iter()
+        .find_map(|e| match e {
+            Event::Headers { block, .. } => Some(*block),
+            _ => None,
+        })
+        .expect("received request headers");
+    let received = downstream.server.headers(block).unwrap();
+    let forwarded: Vec<_> = received.all().collect();
+    assert_eq!(forwarded, fields);
+    assert_eq!(received.iter().collect::<Vec<_>>(), fields[4..]);
+
+    let mut upstream = pair();
+    upstream.client.send_headers(S0, &forwarded, true).unwrap();
+    upstream.drive();
+    let block = upstream
+        .events(Side::Server)
+        .iter()
+        .find_map(|e| match e {
+            Event::Headers { block, .. } => Some(*block),
+            _ => None,
+        })
+        .expect("received forwarded headers");
+    let decoded: Vec<_> = upstream.server.headers(block).unwrap().all().collect();
+    assert_eq!(decoded, fields);
+    assert_eq!(decoded[3].name, b":path");
+    assert_eq!(decoded[3].value, b"/");
+    assert!(decoded[3].never_index);
+}
+
+#[test]
 fn never_index_survives_roundtrip() {
     let mut p = pair();
     let mut fields = req("GET");
