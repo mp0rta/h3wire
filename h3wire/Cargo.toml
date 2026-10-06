@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Sans-I/O HTTP/3 (RFC 9114) and QPACK (RFC 9204) engine"
+repository = "https://github.com/mp0rta/h3wire"
+documentation = "https://docs.rs/h3wire"
+readme = "../README.md"
+keywords = ["http3", "quic", "qpack", "sans-io"]
+categories = ["network-programming", "parser-implementations"]
 
 [dependencies]
 
