@@ -3,7 +3,8 @@
 use crate::error::{H3Code, UsageError};
 use crate::qpack::decoder::{DecodedField, Span, decode_field_section};
 
-/// A header field, borrowed: what [`HeaderBlockRef::iter`] yields and what
+/// A header field, borrowed: what [`HeaderBlockRef::all`] and [`HeaderBlockRef::iter`]
+/// yield and what
 /// [`Connection::send_headers`](crate::Connection::send_headers) takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldRef<'a> {
@@ -115,13 +116,18 @@ impl<'a> HeaderBlockRef<'a> {
         self.all().filter(|f| !f.name.starts_with(b":"))
     }
 
-    /// The pseudo-header fields.
+    /// The pseudo-header values. Use [`Self::all`] to also read their `never_index` flags.
     pub fn pseudo(&self) -> &Pseudo<'a> {
         &self.pseudo
     }
 
     /// Every field, pseudo and regular, in wire order.
-    fn all(&self) -> impl Iterator<Item = FieldRef<'a>> + use<'a> {
+    ///
+    /// Preserves each field's [`FieldRef::never_index`] flag, including pseudo-headers.
+    /// Intermediaries forwarding a block with
+    /// [`Connection::send_headers`](crate::Connection::send_headers) must preserve these
+    /// flags (RFC 9204 section 7.1.3); use this iterator to obtain the complete block.
+    pub fn all(&self) -> impl Iterator<Item = FieldRef<'a>> + use<'a> {
         let arena = self.arena;
         let span = move |s: Span| match s {
             Span::Static(b) => b,
