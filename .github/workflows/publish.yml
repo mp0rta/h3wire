@@ -1,0 +1,61 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main' && github.repository == 'mp0rta/h3wire'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: '1.85'
+      - run: cargo +1.85 build -p h3wire --locked
+      - run: cargo +stable package -p h3wire --locked
+      - run: cargo +stable test --manifest-path target/package/h3wire-*/Cargo.toml --locked
+      - run: cargo +stable publish -p h3wire --locked --dry-run
+
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.repository == 'mp0rta/h3wire'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - run: cargo publish -p h3wire --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
