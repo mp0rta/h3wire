@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! Connection configuration and extension-point registration.
 
 use crate::error::{UsageError, is_grease_id};

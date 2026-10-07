@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! HTTP/3 frame header codec (RFC 9114 section 7.1).
 
 use crate::varint;

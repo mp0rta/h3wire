@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! GOAWAY by role, the "processed" invariant, and the hooks used by the send and receive
 //! paths (spec section 4, "GOAWAY").
 

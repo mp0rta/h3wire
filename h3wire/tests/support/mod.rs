@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! In-memory fake transport and wire-building helpers shared by integration tests.
 #![allow(dead_code)]
 

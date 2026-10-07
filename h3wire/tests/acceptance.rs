@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! v0.1 acceptance index (spec section 5.2, gate (a) of spec section 1.2).
 //!
 //! Every bullet of the "v0.1 acceptance suite" and the test(s) that cover it.

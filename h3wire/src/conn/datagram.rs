@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! HTTP Datagram framing and routing (RFC 9297 section 2.1, spec section 2.5).
 
 use super::{Connection, Role};

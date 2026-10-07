@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! SETTINGS frame codec (RFC 9114 section 7.2.4).
 
 use crate::config::Config;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! Sans-I/O HTTP/3 ([RFC 9114]) and QPACK ([RFC 9204]) engine.
 //!
 //! A [`Connection`] is the HTTP/3 layer of one QUIC connection. It does no I/O, owns no

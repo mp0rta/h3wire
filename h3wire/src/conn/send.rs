@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! Per-stream send path: uni stream binding, the core-owned byte queues, HEADERS,
 //! scatter/gather DATA, and the send phases ending in exactly one FIN.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! QPACK field section encoder: static table and literals only (RFC 9204 section 4.5).
 
 use super::{prefix_int, static_table};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! QPACK (RFC 9204) building blocks.
 
 pub mod decoder;
