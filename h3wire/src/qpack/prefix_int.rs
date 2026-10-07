@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! RFC 7541 section 5 prefix integers and string literals.
 
 use super::{QpackError, huffman};

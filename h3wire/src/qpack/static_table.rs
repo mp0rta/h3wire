@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! QPACK static table (RFC 9204 Appendix A).
 
 type E = (&'static [u8], &'static [u8]);

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! Header field types, the received header block store, and HTTP/3 message validation.
 
 use crate::error::{H3Code, UsageError};

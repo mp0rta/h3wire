@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! QPACK encoder/decoder stream instruction parsers (v0.1 rules: no dynamic table).
 
 use super::{QpackError, prefix_int};

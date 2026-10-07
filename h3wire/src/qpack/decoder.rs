@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! QPACK field section decoder: static table and literals only (v0.1).
 
 use super::{prefix_int, static_table};

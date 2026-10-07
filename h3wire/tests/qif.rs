@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! Decode other implementations' QPACK encoder output (qpackers/qifs, dynamic table
 //! capacity 0) and compare with the source header lists.
 

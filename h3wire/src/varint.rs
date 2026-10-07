@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! QUIC variable-length integers (RFC 9000 section 16).
 
 pub const MAX: u64 = (1 << 62) - 1;

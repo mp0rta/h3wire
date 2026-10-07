@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! Split / partial-write / fragmentation properties (spec section 5.2) and the trace
 //! invariant checker.
 

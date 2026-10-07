@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 #![no_main]
 
 use h3wire::{Action, Role, StreamId};

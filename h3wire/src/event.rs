@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! What the connection reports to the application (`Event`), asks of the transport
 //! (`Action`), and returns from `recv` and `parse_datagram`.
 

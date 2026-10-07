@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 mp0rta
 //! Receive on request streams (RFC 9114 sections 4.1, 4.4, 7): the frame sequence,
 //! header blocks with release backpressure, DATA, extension frames, and message
 //! completeness at FIN.
