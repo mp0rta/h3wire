@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "Runtime-neutral async HTTP/3 over the sans-I/O h3wire core"
 repository = "https://github.com/mp0rta/h3wire"
 documentation = "https://docs.rs/h3wire-async"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["http3", "quic", "async", "masque"]
 categories = ["network-programming", "asynchronous"]
 
