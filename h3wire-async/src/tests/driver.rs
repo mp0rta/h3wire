@@ -298,13 +298,20 @@ fn once_slot_single_consumption() {
 fn error_source_not_repeated_in_display() {
     use crate::quic::TransportError;
     use std::error::Error as _;
-    let t: Error = ErrorKind::Transport(Arc::new(TransportError {
-        peer_app_code: Some(0x10c),
-        peer_transport_code: None,
-        source: "link down".into(),
-    }))
+    let t: Error = ErrorKind::Transport(Arc::new(
+        TransportError::new("link down").with_peer_app_code(0x10c),
+    ))
     .into();
     assert_eq!(t.to_string(), "transport error (peer closed with 0x10c)");
+    let clean = TransportError::new("closed").with_peer_transport_code(0);
+    assert_eq!(
+        (clean.peer_app_code, clean.peer_transport_code),
+        (None, Some(0))
+    );
+    assert_eq!(
+        clean.to_string(),
+        "transport error (peer closed with transport code 0x0)"
+    );
     let cause = t.source().expect("the TransportError");
     assert_eq!(cause.source().expect("its cause").to_string(), "link down");
     let b: Error = ErrorKind::Body(Arc::new("bad chunk".into())).into();

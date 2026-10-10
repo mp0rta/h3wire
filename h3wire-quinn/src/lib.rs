@@ -91,15 +91,16 @@ where
 
 /// A connection failure; a close by the peer keeps its application or transport code.
 fn transport(e: ConnectionError) -> TransportError {
-    let (peer_app_code, peer_transport_code) = match &e {
-        ConnectionError::ApplicationClosed(c) => (Some(c.error_code.into_inner()), None),
-        ConnectionError::ConnectionClosed(c) => (None, Some(u64::from(c.error_code))),
-        _ => (None, None),
-    };
-    TransportError {
-        peer_app_code,
-        peer_transport_code,
-        source: Box::new(e),
+    match &e {
+        ConnectionError::ApplicationClosed(c) => {
+            let code = c.error_code.into_inner();
+            TransportError::new(e).with_peer_app_code(code)
+        }
+        ConnectionError::ConnectionClosed(c) => {
+            let code = u64::from(c.error_code);
+            TransportError::new(e).with_peer_transport_code(code)
+        }
+        _ => TransportError::new(e),
     }
 }
 
@@ -250,11 +251,7 @@ impl quic::SendStream for QuinnSend {
             Ok(code) => Ok(code.map(VarInt::into_inner)),
             Err(quinn::StoppedError::ConnectionLost(e)) => Err(transport(e)),
             // A rejected 0-RTT stream never reaches the peer; h3wire never opens one.
-            Err(e @ quinn::StoppedError::ZeroRttRejected) => Err(TransportError {
-                peer_app_code: None,
-                peer_transport_code: None,
-                source: Box::new(e),
-            }),
+            Err(e @ quinn::StoppedError::ZeroRttRejected) => Err(TransportError::new(e)),
         })
     }
 }

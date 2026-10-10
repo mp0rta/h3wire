@@ -165,11 +165,10 @@ struct Dead {
 }
 
 fn dead_err(d: Dead) -> TransportError {
-    TransportError {
-        peer_app_code: d.app,
-        peer_transport_code: d.transport,
-        source: "mock transport is dead".into(),
-    }
+    let mut e = TransportError::new("mock transport is dead");
+    e.peer_app_code = d.app;
+    e.peer_transport_code = d.transport;
+    e
 }
 
 impl Net {

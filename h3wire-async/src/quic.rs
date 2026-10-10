@@ -18,8 +18,10 @@ pub struct Written {
     pub chunks: usize,
 }
 
-/// A failure of the QUIC connection itself.
+/// A failure of the QUIC connection itself. Backends build it with
+/// [`new`](Self::new) and the `with_*` setters.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct TransportError {
     /// The application error code the peer closed with, if it did.
     pub peer_app_code: Option<u64>,
@@ -28,6 +30,29 @@ pub struct TransportError {
     pub peer_transport_code: Option<u64>,
     /// The underlying transport error.
     pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl TransportError {
+    /// A connection failure caused by `source`; the peer's close codes are unset.
+    pub fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        TransportError {
+            peer_app_code: None,
+            peer_transport_code: None,
+            source: source.into(),
+        }
+    }
+
+    /// The peer closed the connection with application error code `code`.
+    pub fn with_peer_app_code(mut self, code: u64) -> Self {
+        self.peer_app_code = Some(code);
+        self
+    }
+
+    /// The peer closed the connection with QUIC transport error code `code`.
+    pub fn with_peer_transport_code(mut self, code: u64) -> Self {
+        self.peer_transport_code = Some(code);
+        self
+    }
 }
 
 impl fmt::Display for TransportError {
