@@ -574,13 +574,16 @@ async fn peer_reset_cancels_service() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_reordered_headers() {
     with_timeout(async {
-        // The response on 4 waits for `release`, so the server cannot drain before 12.
+        // The response on 0 waits for `release`, so the server cannot drain (and close)
+        // before 4's late HEADERS arrive; a hole never sent on is not waited for.
+        let (started_tx, started) = oneshot::channel::<()>();
         let (release, held) = oneshot::channel::<()>();
-        let held = std::sync::Arc::new(std::sync::Mutex::new(Some(held)));
+        let held = std::sync::Arc::new(std::sync::Mutex::new(Some((started_tx, held))));
         let svc = Svc(move |req: Request<RecvBody>| -> Fut {
             let held = (req.uri().path() == "/held").then(|| held.lock().unwrap().take());
             Box::pin(async move {
-                if let Some(Some(h)) = held {
+                if let Some(Some((started, h))) = held {
+                    let _ = started.send(());
                     h.await?;
                 }
                 Ok(Response::new(full("ok")))
@@ -592,14 +595,15 @@ async fn shutdown_reordered_headers() {
         }
         // HEADERS on 0 and 8; those on 4 are held back. Stream 8 opens 4 at the server.
         let get = req_fields("GET", "/");
-        peer.send_headers(S0, &get, true).unwrap();
+        peer.send_headers(S0, &req_fields("GET", "/held"), true)
+            .unwrap();
         peer.send_headers(S8, &get, true).unwrap();
-        peer.run_until(|p| finished(p, S0) && finished(p, S8)).await;
+        drive(&mut peer, started).await.unwrap();
+        peer.run_until(|p| finished(p, S8)).await;
         server.shutdown().await;
         // Queued before the peer reads any GOAWAY (its core then refuses new requests),
         // so they reach the server during its shutdown.
-        peer.send_headers(S4, &req_fields("GET", "/held"), true)
-            .unwrap();
+        peer.send_headers(S4, &get, true).unwrap();
         // 8 was processed before the cutoff, so the cutoff is 12.
         let goaway12 = PeerObs::Event(Event::GoAway { id: 12 });
         peer.run_until(|p| p.trace().contains(&goaway12)).await;
@@ -611,14 +615,45 @@ async fn shutdown_reordered_headers() {
             code: H3Code::REQUEST_REJECTED.0,
         };
         peer.run_until(|p| p.trace().contains(&rejected)).await;
-        // The request below the cutoff is still served.
-        release.send(()).unwrap();
+        // The request below the cutoff that arrived during the shutdown is served.
         peer.run_until(|p| finished(p, S4)).await;
         assert_eq!(peer.body(S4), b"ok");
+        release.send(()).unwrap();
+        peer.run_until(|p| finished(p, S0)).await;
         drive(&mut peer, &mut server.done)
             .await
             .unwrap()
             .expect("a clean close");
+    })
+    .await
+}
+
+/// quinn hands out stream 4 once 8 arrives (implicitly opened); the peer never sends on
+/// it, and graceful shutdown still closes (spec §4.2: holes are not waited for).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_skips_unused_hole() {
+    with_timeout(async {
+        let ok = Svc(|_| -> Fut { Box::pin(async { Ok(Response::new(full("ok"))) }) });
+        let (mut peer, mut server, conns) = peer_client(ok).await;
+        for want in [S0, S4, S8] {
+            assert_eq!(peer.open_bidi().await.unwrap(), want);
+        }
+        let get = req_fields("GET", "/");
+        peer.send_headers(S0, &get, true).unwrap();
+        peer.send_headers(S8, &get, true).unwrap();
+        peer.run_until(|p| finished(p, S0) && finished(p, S8)).await;
+        server.shutdown().await;
+        drive(&mut peer, &mut server.done)
+            .await
+            .unwrap()
+            .expect("a clean close");
+        // The peer sees the close: H3_NO_ERROR.
+        match conns.client.closed().await {
+            quinn::ConnectionError::ApplicationClosed(c) => {
+                assert_eq!(c.error_code.into_inner(), H3Code::NO_ERROR.0)
+            }
+            e => panic!("{e:?}"),
+        }
     })
     .await
 }
