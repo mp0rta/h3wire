@@ -300,9 +300,13 @@ fn tokio_executor_runs_task() {
     let flag = ran.clone();
     rt.block_on(async move {
         TokioExecutor.execute(Box::pin(async move { flag.store(true, Ordering::SeqCst) }));
-        // The spawned task runs when this one yields; no sleeps.
-        while !ran.load(Ordering::SeqCst) {
+        // The spawned task runs when this one yields; no sleeps, and a bounded wait.
+        for _ in 0..1000 {
+            if ran.load(Ordering::SeqCst) {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(ran.load(Ordering::SeqCst), "the task did not run");
     });
 }
