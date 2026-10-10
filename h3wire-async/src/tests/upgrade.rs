@@ -28,13 +28,13 @@ use tower_service::Service;
 const S0: StreamId = StreamId(0);
 const S4: StreamId = StreamId(4);
 
-type Reply = oneshot::Sender<Response<String>>;
-type Handed = (Request<RecvBody>, Reply);
+pub(super) type Reply = oneshot::Sender<Response<String>>;
+pub(super) type Handed = (Request<RecvBody>, Reply);
 type Fut = Pin<Box<dyn Future<Output = Result<Response<String>, BoxError>> + Send>>;
 
 /// A Service that hands each request to the test, with the sender for its response.
 #[derive(Clone)]
-struct Handoff(mpsc::UnboundedSender<Handed>);
+pub(super) struct Handoff(pub(super) mpsc::UnboundedSender<Handed>);
 
 impl Service<Request<RecvBody>> for Handoff {
     type Response = Response<String>;
@@ -52,15 +52,15 @@ impl Service<Request<RecvBody>> for Handoff {
     }
 }
 
-struct Pair {
-    net: MockNet,
-    send: SendRequest<String>,
-    reqs: mpsc::UnboundedReceiver<Handed>,
-    exec: TestExec,
+pub(super) struct Pair {
+    pub(super) net: MockNet,
+    pub(super) send: SendRequest<String>,
+    pub(super) reqs: mpsc::UnboundedReceiver<Handed>,
+    pub(super) exec: TestExec,
 }
 
 /// An h3wire-async client (built by `cb`) and server (built by `sb`), both spawned.
-fn pair(cb: &Builder, sb: &Builder) -> Pair {
+pub(super) fn pair(cb: &Builder, sb: &Builder) -> Pair {
     let (net, c, s) = MockNet::pair();
     let exec = TestExec::default();
     let (tx, reqs) = mpsc::unbounded();
@@ -75,11 +75,11 @@ fn pair(cb: &Builder, sb: &Builder) -> Pair {
     }
 }
 
-fn plain() -> Pair {
+pub(super) fn plain() -> Pair {
     pair(&Builder::new(), &Builder::new())
 }
 
-fn connect() -> Request<String> {
+pub(super) fn connect() -> Request<String> {
     Request::builder()
         .method(Method::CONNECT)
         .uri("a:443")
@@ -87,7 +87,7 @@ fn connect() -> Request<String> {
         .unwrap()
 }
 
-fn reply(status: u16, body: &str) -> Response<String> {
+pub(super) fn reply(status: u16, body: &str) -> Response<String> {
     Response::builder()
         .status(status)
         .body(body.to_string())
@@ -95,26 +95,26 @@ fn reply(status: u16, body: &str) -> Response<String> {
 }
 
 /// Yield until `pred` holds; every spawned task runs meanwhile.
-async fn until(mut pred: impl FnMut() -> bool) {
+pub(super) async fn until(mut pred: impl FnMut() -> bool) {
     while !pred() {
         yield_now().await;
     }
 }
 
 /// Let every spawned task run to quiescence.
-async fn quiesce() {
+pub(super) async fn quiesce() {
     for _ in 0..64 {
         yield_now().await;
     }
 }
 
-async fn out<T>(o: &Out<T>) -> T {
+pub(super) async fn out<T>(o: &Out<T>) -> T {
     until(|| done(o)).await;
     take(o)
 }
 
 /// Send `r`; resolve with the request the server's Service received.
-async fn request(
+pub(super) async fn request(
     p: &mut Pair,
     r: Request<String>,
 ) -> (Out<Result<Response<RecvBody>, Error>>, Handed) {
@@ -143,7 +143,7 @@ async fn read_to_end(t: &mut Tunnel) -> Vec<u8> {
     v
 }
 
-fn reset_by(net: &MockNet, side: Side, s: StreamId) -> Option<u64> {
+pub(super) fn reset_by(net: &MockNet, side: Side, s: StreamId) -> Option<u64> {
     net.trace().iter().find_map(|o| match *o {
         MockObs::Reset {
             side: x,
@@ -154,7 +154,7 @@ fn reset_by(net: &MockNet, side: Side, s: StreamId) -> Option<u64> {
     })
 }
 
-fn stopped_by(net: &MockNet, side: Side, s: StreamId) -> Option<u64> {
+pub(super) fn stopped_by(net: &MockNet, side: Side, s: StreamId) -> Option<u64> {
     net.trace().iter().find_map(|o| match *o {
         MockObs::Stop {
             side: x,
@@ -165,7 +165,7 @@ fn stopped_by(net: &MockNet, side: Side, s: StreamId) -> Option<u64> {
     })
 }
 
-fn aborted_any(net: &MockNet, s: StreamId) -> bool {
+pub(super) fn aborted_any(net: &MockNet, s: StreamId) -> bool {
     [Side::Client, Side::Server]
         .iter()
         .any(|&x| reset_by(net, x, s).is_some() || stopped_by(net, x, s).is_some())

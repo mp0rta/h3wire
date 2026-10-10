@@ -14,6 +14,7 @@ pub mod __testing;
 pub mod body;
 pub mod builder;
 pub mod client;
+pub mod datagram;
 // Driver, shared state and OnceSlot are wired up by the client and server (Tasks 6–9).
 #[allow(dead_code)]
 mod driver;

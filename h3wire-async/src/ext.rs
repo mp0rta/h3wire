@@ -65,6 +65,16 @@ impl ConnInfo {
         })
     }
 
+    /// Datagram accounting for the bound oracle: (datagrams in registered queues, pending
+    /// datagrams, pending bytes). Not public API.
+    #[doc(hidden)]
+    pub fn __debug_datagram_accounting(&self) -> (usize, usize, usize) {
+        self.shared.with(|i| {
+            let queued = i.streams.values().map(|s| s.dgram.queue.len()).sum();
+            (queued, i.dgram.pending.len(), i.dgram.pending_bytes)
+        })
+    }
+
     /// Wait for the peer's SETTINGS; `None` if the connection closes first.
     pub async fn settings(&self) -> Option<PeerSettings> {
         poll_fn(|cx| {

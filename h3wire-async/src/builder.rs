@@ -104,7 +104,8 @@ impl Builder {
         self
     }
 
-    /// Capacity of a registered datagram queue (drop-oldest). Default 64.
+    /// Capacity of a registered datagram queue, and of the connection's queue of datagrams
+    /// waiting for the driver to send them (both drop-oldest). Default 64.
     pub fn datagram_queue(&mut self, n: usize) -> &mut Self {
         self.datagram_queue = n;
         self

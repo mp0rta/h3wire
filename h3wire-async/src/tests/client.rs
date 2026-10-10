@@ -8,7 +8,8 @@ use crate::__testing::{CorePeer, MockConn, MockNet, MockObs, Side};
 use crate::body::RecvBody;
 use crate::builder::Builder;
 use crate::client::{ClientConnection, SendRequest};
-use crate::error::{BoxError, Error, ErrorKind};
+use crate::datagram::{DatagramSlot, RegisterDatagrams};
+use crate::error::{BoxError, DatagramError, Error, ErrorKind};
 use crate::ext::Protocol;
 use crate::upgrade;
 use h3wire::{AbortSource, Config, H3Code, Role, StreamId, UsageError};
@@ -27,7 +28,7 @@ type Resp = Result<Response<RecvBody>, Error>;
 
 /// A client (`SendRequest` + connection) on one side of a mock pair, a server `CorePeer`
 /// on the other.
-fn client<B>(
+pub(super) fn client<B>(
     b: &Builder,
     peer_cfg: Config,
 ) -> (
@@ -57,7 +58,7 @@ fn req<B>(method: Method, uri: &str, body: B) -> Request<B> {
         .unwrap()
 }
 
-fn get(uri: &str) -> Request<String> {
+pub(super) fn get(uri: &str) -> Request<String> {
     req(Method::GET, uri, String::new())
 }
 
@@ -485,8 +486,9 @@ fn peer_bidi_stream_is_connection_error() {
 }
 
 /// Live handles of every kind when `fail` strikes: the driver, a live `RecvBody`, a
-/// `send_request` waiting for its response, a `Tunnel` waiting to receive, and one
-/// `send_request` waiting for stream credit. The tunnel's error comes last in the list.
+/// `send_request` waiting for its response, a `Tunnel` waiting to receive, a `Datagrams`
+/// waiting to receive, and one `send_request` waiting for stream credit. The datagram
+/// and tunnel errors come last in the list (`Datagrams::send` must fail `Closed`).
 fn every_handle(
     fail: impl FnOnce(&MockNet, &mut Peer),
 ) -> (Result<(), Error>, ErrorKind, Vec<ErrorKind>) {
@@ -495,11 +497,20 @@ fn every_handle(
     net.max_bidi_streams(Side::Client, 3);
     let drv = spawn(&exec, conn);
     let (body, pending, tunnel) = run(&exec, async {
-        let a = spawn(&exec, send.send_request(get("https://a/a")));
+        let mut ra = get("https://a/a");
+        ra.extensions_mut().insert(RegisterDatagrams);
+        let a = spawn(&exec, send.send_request(ra));
         peer.run_until(|p| seen(p, S0)).await;
         peer.send_headers(S0, &[(":status", "200")], false).unwrap();
         peer.run_until(|_| done(&a)).await;
-        let mut rb = take(&a).unwrap().into_body();
+        let ra = take(&a).unwrap();
+        let slot = ra.extensions().get::<DatagramSlot>().unwrap();
+        let mut dg = slot.register().expect("datagrams");
+        let dgram = spawn(&exec, async move {
+            let r = dg.recv().await;
+            (r, dg.send(bytes::Bytes::from_static(b"x")))
+        });
+        let mut rb = ra.into_body();
         let body = spawn(&exec, async move {
             poll_fn(|cx| Pin::new(&mut rb).poll_frame(cx)).await
         });
@@ -520,13 +531,20 @@ fn every_handle(
         let c = spawn(&exec, send.send_request(get("https://a/c")));
         settle(&mut peer).await;
         assert!(!done(&body) && !done(&b) && !done(&c) && !done(&tunnel) && !done(&drv));
+        assert!(!done(&dgram));
         fail(&net, &mut peer);
-        let all = |_: &Peer| done(&drv) && done(&body) && done(&b) && done(&c) && done(&tunnel);
+        let all = |_: &Peer| {
+            done(&drv) && done(&body) && done(&b) && done(&c) && done(&tunnel) && done(&dgram)
+        };
         peer.run_until(all).await;
-        (body, vec![b, c], tunnel)
+        (body, vec![b, c], (tunnel, dgram))
     });
+    let (tunnel, dgram) = tunnel;
     let body = take(&body).expect("a frame").unwrap_err().kind().clone();
     let mut pending: Vec<_> = pending.iter().map(|o| err_kind(take(o))).collect();
+    let (recv, sent) = take(&dgram);
+    assert_eq!(sent, Err(DatagramError::Closed));
+    pending.push(recv.expect_err("must fail").kind().clone());
     pending.push(take(&tunnel).expect_err("must fail").kind().clone());
     (take(&drv), body, pending)
 }

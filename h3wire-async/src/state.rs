@@ -5,6 +5,7 @@
 //! Locking rule: the lock is never held while polling user code or a transport object.
 //! Wakers collected under the lock (`pending_wakers`) are woken after it is released.
 
+use crate::driver::datagram::{DgramState, Dgrams};
 use crate::error::{Error, ErrorKind};
 use crate::http_map::Fields;
 use crate::quic::TransportError;
@@ -72,6 +73,8 @@ pub(crate) struct StreamState {
     pub expect_continue: bool,
     /// The upgrade of a CONNECT (spec §4.5).
     pub up: Up,
+    /// HTTP datagrams (spec §3.4).
+    pub dgram: DgramState,
 }
 
 /// Where a CONNECT stream's upgrade stands (spec §4.5). The `Claim` holding it counts one
@@ -106,7 +109,18 @@ impl StreamState {
             task_failed: false,
             expect_continue: false,
             up: Up::None,
+            dgram: DgramState::default(),
         }
+    }
+
+    /// The receive side failed with `e`: recorded for its reader and the datagram
+    /// handle, which are woken.
+    pub(crate) fn fail_recv(&mut self, e: Error, wakers: &mut Vec<Waker>) {
+        self.recv.trailers = None;
+        self.recv.error = Some(e.clone());
+        self.dgram.error = Some(e);
+        wakers.extend(self.recv.waker.take());
+        wakers.extend(self.dgram.waker.take());
     }
 
     pub(crate) fn recv_terminal(&self) -> bool {
@@ -193,6 +207,8 @@ pub(crate) type OnOpen = Box<dyn FnOnce(StreamId) + Send>;
 pub(crate) struct Open {
     /// The HEADERS, whether they end the stream, and the body pipe. Taken by the driver.
     pub req: Option<(Fields, bool, Option<OnOpen>)>,
+    /// `RegisterDatagrams`: the stream starts with datagram semantics registered.
+    pub datagrams: bool,
     pub done: Option<Result<StreamId, Error>>,
     pub waker: Option<Waker>,
 }
@@ -226,6 +242,8 @@ pub(crate) struct Inner {
     pub cap_waiters: HashSet<StreamId>,
     /// Per-stream send-queue capacity `S`.
     pub send_capacity: usize,
+    /// HTTP datagram queues and limits (spec §3.4).
+    pub dgram: Dgrams,
 }
 
 impl Inner {
@@ -272,6 +290,7 @@ impl Inner {
         for st in self.streams.values_mut() {
             self.pending_wakers.extend(st.recv.waker.take());
             self.pending_wakers.extend(st.send.waker.take());
+            self.pending_wakers.extend(st.dgram.waker.take());
             for (_, t) in st.cancels.drain(..) {
                 self.pending_wakers.extend(t.fire());
             }
@@ -358,6 +377,7 @@ impl Inner {
         }
         self.retained.remove(&id);
         self.cap_waiters.remove(&id);
+        self.dgram.take_pending(id); // the request ended undecided
     }
 
     /// The send side of `id` is over (finished, stopped, reset or aborted): drop what is
@@ -407,9 +427,7 @@ impl Inner {
         .into();
         let (recv, send) = (!st.recv_terminal(), !st.send.done);
         if recv {
-            st.recv.trailers = None;
-            st.recv.error = Some(e.clone());
-            self.pending_wakers.extend(st.recv.waker.take());
+            st.fail_recv(e.clone(), &mut self.pending_wakers);
             self.discard_body(id);
         }
         if send {
@@ -551,6 +569,7 @@ impl Shared {
             speculative: 0,
             cap_waiters: HashSet::new(),
             send_capacity: 64 * 1024,
+            dgram: Dgrams::default(),
         })))
     }
 

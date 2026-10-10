@@ -8,13 +8,15 @@
 //! 2. accepts peer streams; a client opens streams for queued requests;
 //! 3. writes the core's sendable streams (one write each);
 //! 4. serves readiness tokens round-robin (reads, writes, `poll_stopped`);
-//! 5. dispatches core events (also right after each `recv`, see `recv.rs`);
-//! 6. closes with `H3_NO_ERROR` once a graceful shutdown has drained;
-//! 7. stops once the connection is closed.
+//! 5. sends and drains datagrams (`datagram.rs`);
+//! 6. dispatches core events (also right after each `recv`, see `recv.rs`);
+//! 7. closes with `H3_NO_ERROR` once a graceful shutdown has drained;
+//! 8. stops once the connection is closed.
 //!
 //! The shared lock is never held across a transport call: a transport may invoke a
 //! readiness waker synchronously, and that waker takes the lock.
 
+pub(crate) mod datagram;
 mod recv;
 mod send;
 
@@ -67,8 +69,12 @@ impl<C: quic::Connection> Driver<C> {
     pub(crate) fn new(conn: C, role: Role, b: &Builder) -> Self {
         let config = b.core_config(conn.max_datagram_size().is_some());
         let discovery_len = config.max_encoded_field_section_size.saturating_add(16);
+        let on = config.h3_datagram;
         let shared = Shared::new(h3wire::Connection::new(role, config));
-        shared.with(|i| i.send_capacity = b.send_capacity);
+        shared.with(|i| {
+            i.send_capacity = b.send_capacity;
+            i.dgram = datagram::Dgrams::new(b, on);
+        });
         Driver {
             conn,
             shared,
@@ -140,6 +146,7 @@ impl<C: quic::Connection> Driver<C> {
         moved |= self.accept(cx, budget)?;
         moved |= self.write_sendable(budget)?;
         moved |= self.serve_ready(budget)?;
+        moved |= self.datagrams(cx, budget)?;
         self.shared.with(dispatch_events);
         let cutoff = self.role == Role::Client || self.cutoff_sent;
         if cutoff && self.shared.with(|i| i.graceful) && self.drained() {
@@ -309,16 +316,19 @@ impl<C: quic::Connection> Driver<C> {
                     return (false, None);
                 };
                 let (fields, end, on_open) = o.req.take().expect("queued");
+                let dgram = o.datagrams;
                 let res = i.conn.send_headers(id, &fields.as_refs(), end);
                 let sent = res.is_ok();
                 o.done = Some(res.map(|()| id).map_err(|e| ErrorKind::Usage(e).into()));
                 i.pending_wakers.extend(o.waker.take());
                 if sent {
                     // The user is the request's `InFlight`.
-                    let st = StreamState {
+                    let mut st = StreamState {
                         users: 1,
                         ..StreamState::new()
                     };
+                    st.dgram.registered = dgram;
+                    st.dgram.decided = dgram;
                     i.streams.insert(id, st);
                     i.push_ready(id, Dir::Recv);
                     i.push_ready(id, Dir::Send);
@@ -424,6 +434,7 @@ pub(crate) fn dispatch_events(i: &mut Inner) {
                 if let Some(st) = i.streams.get_mut(&stream) {
                     st.recv.eof = true;
                     i.pending_wakers.extend(st.recv.waker.take());
+                    i.pending_wakers.extend(st.dgram.waker.take());
                 }
                 i.fire_cancels(stream);
             }
@@ -446,11 +457,9 @@ pub(crate) fn dispatch_events(i: &mut Inner) {
                 }
                 .into();
                 if let Some(st) = i.streams.get_mut(&stream) {
-                    st.recv.trailers = None;
-                    st.recv.error = Some(e.clone());
+                    st.fail_recv(e.clone(), &mut i.pending_wakers);
                     // A whole-stream abort ends the send side too.
                     st.send.error = Some(e);
-                    i.pending_wakers.extend(st.recv.waker.take());
                 }
                 i.send_terminal(stream);
             }

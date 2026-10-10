@@ -328,6 +328,12 @@ impl MockNet {
         self.lock().sides[side.idx()].max_dgram = n;
     }
 
+    /// Skip the next `n` bidirectional stream ids of `side`, as QUIC allows (they are
+    /// opened implicitly and never used).
+    pub fn skip_bidi(&self, side: Side, n: u64) {
+        self.lock().sides[side.idx()].next_bidi += n;
+    }
+
     /// Race injection: a poll that returns `Pending` also wakes the waker it just
     /// registered, as if readiness arrived before registration completed.
     pub fn readiness_before_register(&self, on: bool) {

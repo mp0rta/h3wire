@@ -4,6 +4,7 @@
 
 use crate::body::{RecvBody, pipe_body};
 use crate::builder::Builder;
+use crate::datagram::DatagramSlot;
 use crate::driver::Driver;
 use crate::error::{BoxError, Error, ErrorKind};
 use crate::ext::ConnInfo;
@@ -115,6 +116,12 @@ impl<C: quic::Connection, S, E> ServerConnection<C, S, E> {
     pub fn __debug_recv_accounting(&self) -> (usize, usize, usize) {
         ConnInfo::new(self.driver.shared()).__debug_recv_accounting()
     }
+
+    /// See `ConnInfo::__debug_datagram_accounting`. Not public API.
+    #[doc(hidden)]
+    pub fn __debug_datagram_accounting(&self) -> (usize, usize, usize) {
+        ConnInfo::new(self.driver.shared()).__debug_datagram_accounting()
+    }
 }
 
 impl<C, S, B, E> ServerConnection<C, S, E>
@@ -143,7 +150,7 @@ where
                 }
                 Poll::Ready(Ok(())) => {}
             }
-            let Some((id, req, token)) = shared.with(next_request) else {
+            let Some((id, req, token, dgram)) = shared.with(next_request) else {
                 return Some(true);
             };
             // Built first: if `call` panics, its drop still commits the abort.
@@ -161,7 +168,12 @@ where
                 req.extensions_mut()
                     .insert(UpgradeCell(OnceSlot::new(claim)));
             }
-            // Further request extensions go here (Task 9: datagrams).
+            if dgram {
+                // Its user was counted by `next_request`.
+                let slot = DatagramSlot::new(shared.clone(), id);
+                req.extensions_mut().insert(slot);
+            }
+            // Further request extensions go here.
             let head = req.method() == Method::HEAD;
             let fut = self.service.call(req);
             task.fut = Some(Box::pin(respond(shared.clone(), id, head, connect, fut)));
@@ -171,10 +183,11 @@ where
     }
 }
 
-/// The next delivered request: its head is released, and its entry gains two users (the
-/// `RecvBody` and the task; a CONNECT's upgrade claim is a third), the task's ownership
-/// and its cancel token.
-fn next_request(i: &mut Inner) -> Option<(StreamId, Request<()>, CancelToken)> {
+/// The next delivered request: its head is released, and its entry gains a user for each
+/// of the `RecvBody`, the task, a CONNECT's upgrade claim and, while `H3_DATAGRAM` is
+/// advertised, the `Datagrams` in its slot (the returned flag); the task's ownership and
+/// its cancel token.
+fn next_request(i: &mut Inner) -> Option<(StreamId, Request<()>, CancelToken, bool)> {
     while let Some(id) = i.incoming.pop_front() {
         // None: aborted (and reaped) before dispatch.
         let Some(b) = i.streams.get_mut(&id).and_then(|s| s.head.take()) else {
@@ -192,19 +205,16 @@ fn next_request(i: &mut Inner) -> Option<(StreamId, Request<()>, CancelToken)> {
             // The core dropped its blocks: the connection closed.
             Err(_) => continue,
         };
+        let dgram = i.dgram.on;
         let st = i.streams.get_mut(&id).expect("checked above");
-        st.users += if req.method() == Method::CONNECT {
-            3
-        } else {
-            2
-        };
+        st.users += 2 + usize::from(req.method() == Method::CONNECT) + usize::from(dgram);
         st.recv.task_owned = true;
         st.expect_continue = req
             .headers()
             .get(EXPECT)
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
         let token = i.cancel_token(id, Owns::Both);
-        return Some((id, req, token));
+        return Some((id, req, token, dgram));
     }
     None
 }
@@ -253,6 +263,7 @@ where
             if connect {
                 settle(i, id, Err(not_upgraded()));
             }
+            i.decide_datagrams(id);
             return false;
         }
         // Err (an invalid response): `final_sent` stays false.
@@ -266,6 +277,7 @@ where
         if connect {
             settle(i, id, if tunnel { Ok(()) } else { Err(not_upgraded()) });
         }
+        i.decide_datagrams(id);
         !end && !tunnel
     });
     if pipe && pipe_body(&shared, id, body).await.is_err() {
