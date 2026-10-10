@@ -13,6 +13,10 @@
 pub mod __testing;
 pub mod builder;
 pub mod error;
+pub mod ext;
+// Consumed by the client and server (later tasks).
+#[allow(dead_code)]
+mod http_map;
 pub mod quic;
 pub mod rt;
 #[cfg(test)]
