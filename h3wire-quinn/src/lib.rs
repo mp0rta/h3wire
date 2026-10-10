@@ -300,7 +300,7 @@ pub fn server<S, B, E>(
     exec: E,
 ) -> ServerConnection<QuinnConnection, S, E>
 where
-    S: Service<Request<RecvBody>, Response = Response<B>> + Clone + Send + 'static,
+    S: Service<Request<RecvBody>, Response = Response<B>> + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<BoxError>,
     B: Body + Send + 'static,

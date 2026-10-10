@@ -38,7 +38,7 @@ impl Builder {
     ) -> ServerConnection<C, S, E>
     where
         C: quic::Connection,
-        S: Service<Request<RecvBody>, Response = Response<B>> + Clone + Send + 'static,
+        S: Service<Request<RecvBody>, Response = Response<B>> + Send + 'static,
         S::Future: Send + 'static,
         S::Error: Into<BoxError>,
         B: Body + Send + 'static,
@@ -128,7 +128,7 @@ impl<C: quic::Connection, S, E> ServerConnection<C, S, E> {
 impl<C, S, B, E> ServerConnection<C, S, E>
 where
     C: quic::Connection,
-    S: Service<Request<RecvBody>, Response = Response<B>> + Clone + Send + 'static,
+    S: Service<Request<RecvBody>, Response = Response<B>> + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<BoxError>,
     B: Body + Send + 'static,
@@ -393,7 +393,7 @@ impl Drop for Unwinding<'_> {
 impl<C, S, B, E> Future for ServerConnection<C, S, E>
 where
     C: quic::Connection,
-    S: Service<Request<RecvBody>, Response = Response<B>> + Clone + Send + 'static,
+    S: Service<Request<RecvBody>, Response = Response<B>> + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<BoxError>,
     B: Body + Send + 'static,

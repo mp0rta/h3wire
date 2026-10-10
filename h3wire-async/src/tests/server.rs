@@ -878,3 +878,48 @@ fn core_peer_reads_held_data_at_close() {
         assert_eq!(peer.body(b), b"ok");
     });
 }
+
+/// A Service that is not `Clone`.
+struct Unique;
+
+impl Service<Request<RecvBody>> for Unique {
+    type Response = Response<String>;
+    type Error = BoxError;
+    type Future = std::future::Ready<Result<Response<String>, BoxError>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: Request<RecvBody>) -> Self::Future {
+        std::future::ready(Ok(Response::new("ok".into())))
+    }
+}
+
+/// The Service need not be `Clone`: one instance serves every request.
+#[test]
+fn service_need_not_be_clone() {
+    let (_net, c, s) = MockNet::pair();
+    let exec = TestExec::default();
+    let srv = Builder::new().serve_connection(s, Unique, exec.clone());
+    spawn(&exec, srv);
+    let mut peer = CorePeer::new(Role::Client, Config::default(), c);
+    run(&exec, async {
+        for _ in 0..2 {
+            let s = peer.open_bidi().await.unwrap();
+            peer.send_headers(
+                s,
+                &[
+                    (":method", "GET"),
+                    (":scheme", "https"),
+                    (":authority", "a"),
+                    (":path", "/"),
+                ],
+                true,
+            )
+            .unwrap();
+            peer.run_until(|p| finished(p, s)).await;
+            assert_eq!(peer.body(s), b"ok");
+        }
+    });
+}
