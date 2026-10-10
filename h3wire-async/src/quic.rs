@@ -23,6 +23,9 @@ pub struct Written {
 pub struct TransportError {
     /// The application error code the peer closed with, if it did.
     pub peer_app_code: Option<u64>,
+    /// The QUIC transport error code the peer closed with (a transport-level
+    /// CONNECTION_CLOSE), if it did. `Some(0)` (`NO_ERROR`) is a clean close.
+    pub peer_transport_code: Option<u64>,
     /// The underlying transport error.
     pub source: Box<dyn std::error::Error + Send + Sync>,
 }
@@ -30,9 +33,15 @@ pub struct TransportError {
 impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The cause is `source()`, not repeated here.
-        match self.peer_app_code {
-            Some(code) => write!(f, "transport error (peer closed with {code:#x})"),
-            None => f.write_str("transport error"),
+        match (self.peer_app_code, self.peer_transport_code) {
+            (Some(code), _) => write!(f, "transport error (peer closed with {code:#x})"),
+            (None, Some(code)) => {
+                write!(
+                    f,
+                    "transport error (peer closed with transport code {code:#x})"
+                )
+            }
+            (None, None) => f.write_str("transport error"),
         }
     }
 }

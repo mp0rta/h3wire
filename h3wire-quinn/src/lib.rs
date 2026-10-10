@@ -84,14 +84,16 @@ where
     r.map_err(transport)
 }
 
-/// A connection failure; an application close by the peer keeps its code.
+/// A connection failure; a close by the peer keeps its application or transport code.
 fn transport(e: ConnectionError) -> TransportError {
-    let peer_app_code = match &e {
-        ConnectionError::ApplicationClosed(c) => Some(c.error_code.into_inner()),
-        _ => None,
+    let (peer_app_code, peer_transport_code) = match &e {
+        ConnectionError::ApplicationClosed(c) => (Some(c.error_code.into_inner()), None),
+        ConnectionError::ConnectionClosed(c) => (None, Some(u64::from(c.error_code))),
+        _ => (None, None),
     };
     TransportError {
         peer_app_code,
+        peer_transport_code,
         source: Box::new(e),
     }
 }
@@ -245,6 +247,7 @@ impl quic::SendStream for QuinnSend {
             // A rejected 0-RTT stream never reaches the peer; h3wire never opens one.
             Err(e @ quinn::StoppedError::ZeroRttRejected) => Err(TransportError {
                 peer_app_code: None,
+                peer_transport_code: None,
                 source: Box::new(e),
             }),
         })
@@ -317,4 +320,36 @@ where
     E: Executor<BoxTask>,
 {
     builder.handshake(QuinnConnection::new(conn), exec).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quinn::{ApplicationClose, ConnectionClose, TransportErrorCode};
+
+    #[test]
+    fn peer_close_codes() {
+        let t = transport(ConnectionError::ConnectionClosed(ConnectionClose {
+            error_code: TransportErrorCode::NO_ERROR,
+            frame_type: None,
+            reason: Bytes::new(),
+        }));
+        assert_eq!((t.peer_app_code, t.peer_transport_code), (None, Some(0)));
+        let t = transport(ConnectionError::ConnectionClosed(ConnectionClose {
+            error_code: TransportErrorCode::PROTOCOL_VIOLATION,
+            frame_type: None,
+            reason: Bytes::new(),
+        }));
+        assert_eq!(t.peer_transport_code, Some(0xa));
+        let t = transport(ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u32(0x100),
+            reason: Bytes::new(),
+        }));
+        assert_eq!(
+            (t.peer_app_code, t.peer_transport_code),
+            (Some(0x100), None)
+        );
+        let t = transport(ConnectionError::TimedOut);
+        assert_eq!((t.peer_app_code, t.peer_transport_code), (None, None));
+    }
 }

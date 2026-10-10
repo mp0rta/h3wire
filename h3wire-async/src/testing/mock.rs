@@ -104,8 +104,8 @@ struct SideState {
     max_dgram: Option<usize>,
     credit: usize,
     used: usize,
-    /// `Some(code)`: the transport is dead; `code` is the peer's application code.
-    dead: Option<Option<u64>>,
+    /// `Some`: the transport is dead, with the peer's close codes (if the peer closed).
+    dead: Option<Dead>,
     closed: Option<u64>,
 }
 
@@ -156,9 +156,17 @@ fn wake(slot: &mut Option<Waker>) {
     }
 }
 
-fn dead_err(code: Option<u64>) -> TransportError {
+/// How a dead transport died: the codes of the peer's close, if it closed.
+#[derive(Clone, Copy, Default)]
+struct Dead {
+    app: Option<u64>,
+    transport: Option<u64>,
+}
+
+fn dead_err(d: Dead) -> TransportError {
     TransportError {
-        peer_app_code: code,
+        peer_app_code: d.app,
+        peer_transport_code: d.transport,
         source: "mock transport is dead".into(),
     }
 }
@@ -351,11 +359,33 @@ impl MockNet {
     /// Fail `side`'s transport; its operations (pending ones included) return
     /// `TransportError { peer_app_code, .. }`.
     pub fn kill_transport(&self, side: Side, peer_app_code: Option<u64>) {
+        self.kill(
+            side,
+            Dead {
+                app: peer_app_code,
+                transport: None,
+            },
+        );
+    }
+
+    /// Fail `side`'s transport as if the peer sent a transport-level CONNECTION_CLOSE
+    /// with `code`: `TransportError { peer_transport_code: Some(code), .. }`.
+    pub fn close_transport(&self, side: Side, code: u64) {
+        self.kill(
+            side,
+            Dead {
+                app: None,
+                transport: Some(code),
+            },
+        );
+    }
+
+    fn kill(&self, side: Side, d: Dead) {
         let mut n = self.lock();
         if n.sides[side.idx()].dead.is_some() {
             return; // first failure wins, as with a real connection
         }
-        n.sides[side.idx()].dead = Some(peer_app_code);
+        n.sides[side.idx()].dead = Some(d);
         n.wake_all();
     }
 
@@ -551,8 +581,11 @@ impl Connection for MockConn {
             code,
         });
         n.sides[self.side.idx()].closed = Some(code);
-        n.sides[self.side.idx()].dead = Some(None);
-        n.sides[self.side.peer().idx()].dead = Some(Some(code));
+        n.sides[self.side.idx()].dead = Some(Dead::default());
+        n.sides[self.side.peer().idx()].dead = Some(Dead {
+            app: Some(code),
+            transport: None,
+        });
         n.wake_all();
     }
 }

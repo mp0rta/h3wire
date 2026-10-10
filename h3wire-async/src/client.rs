@@ -395,8 +395,8 @@ impl Drop for InFlight {
 }
 
 /// The client connection's driver: a future to spawn on the executor. It resolves `Ok`
-/// on a clean close (graceful shutdown, or the peer closing with `H3_NO_ERROR`).
-/// Dropping it closes the connection with `H3_NO_ERROR`.
+/// on a clean close (graceful shutdown, or the peer closing with `H3_NO_ERROR` or with
+/// the transport's `NO_ERROR`). Dropping it closes the connection with `H3_NO_ERROR`.
 pub struct ClientConnection<C: quic::Connection> {
     driver: Driver<C>,
 }

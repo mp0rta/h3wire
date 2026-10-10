@@ -125,13 +125,19 @@ impl<C: quic::Connection> Driver<C> {
 
     /// `Some` once the connection is closed. `Ok` for a clean close: an `H3_NO_ERROR`
     /// close by either side (graceful shutdown, the driver dropped, or the peer closing
-    /// with `H3_NO_ERROR` once it is done). Handles still see the peer's close as
+    /// with `H3_NO_ERROR` once it is done), or a peer's transport-level close with
+    /// `NO_ERROR` (0x0), as curl sends. Handles still see the peer's close as
     /// `Transport`, keeping its code (spec §4.7).
     fn outcome(&self) -> Option<Result<(), Error>> {
         self.shared.with(|i| {
             i.close.as_ref().map(|c| match c {
                 CloseCause::H3 { code, .. } if *code == H3Code::NO_ERROR => Ok(()),
-                CloseCause::Transport(e) if e.peer_app_code == Some(H3Code::NO_ERROR.0) => Ok(()),
+                CloseCause::Transport(e)
+                    if e.peer_app_code == Some(H3Code::NO_ERROR.0)
+                        || e.peer_transport_code == Some(0) =>
+                {
+                    Ok(())
+                }
                 c => Err(c.to_error()),
             })
         })

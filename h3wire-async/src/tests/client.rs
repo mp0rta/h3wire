@@ -589,3 +589,24 @@ fn peer_no_error_close_is_clean() {
     assert!(cause(&body), "{body:?}");
     assert!(pending.iter().all(cause), "{pending:?}");
 }
+
+#[test]
+fn peer_transport_no_error_close_is_clean() {
+    let (drv, body, pending) = every_handle(|net, _| net.close_transport(Side::Client, 0));
+    drv.expect("the peer closed with the transport's NO_ERROR");
+    // Handles keep the cause.
+    let cause =
+        |k: &ErrorKind| matches!(k, ErrorKind::Transport(e) if e.peer_transport_code == Some(0));
+    assert!(cause(&body), "{body:?}");
+    assert!(pending.iter().all(cause), "{pending:?}");
+}
+
+#[test]
+fn peer_transport_error_close_is_not_clean() {
+    let (drv, _, _) = every_handle(|net, _| net.close_transport(Side::Client, 0xa));
+    let k = drv.unwrap_err().kind().clone();
+    assert!(
+        matches!(&k, ErrorKind::Transport(e) if e.peer_transport_code == Some(0xa)),
+        "{k:?}"
+    );
+}

@@ -320,6 +320,7 @@ fn error_source_not_repeated_in_display() {
     use std::error::Error as _;
     let t: Error = ErrorKind::Transport(Arc::new(TransportError {
         peer_app_code: Some(0x10c),
+        peer_transport_code: None,
         source: "link down".into(),
     }))
     .into();
@@ -333,4 +334,34 @@ fn error_source_not_repeated_in_display() {
         "bad chunk"
     );
     assert!(Error::from(ErrorKind::NotUpgraded).source().is_none());
+}
+
+/// A peer's transport-level close: clean with `NO_ERROR`, an error otherwise.
+#[test]
+fn server_peer_transport_close() {
+    for (code, clean) in [(0, true), (0xa, false)] {
+        let (net, driver, mut peer) = setup(Role::Server, &Builder::new(), Config::default());
+        let exec = TestExec::default();
+        let drv = spawn(&exec, driver);
+        run(&exec, async {
+            peer.run_until(|p| !p.trace().is_empty()).await;
+            net.close_transport(Side::Server, code);
+            poll_fn(|_| {
+                if done(&drv) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        });
+        match take(&drv) {
+            Ok(()) => assert!(clean, "{code:#x}"),
+            Err(e) => assert!(
+                !clean
+                    && matches!(e.kind(), ErrorKind::Transport(t) if t.peer_transport_code == Some(code)),
+                "{e:?}"
+            ),
+        }
+    }
 }
