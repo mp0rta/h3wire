@@ -487,6 +487,45 @@ fn ignored_request_body_keeps_complete_response() {
     assert_eq!(s.shared.with(|i| i.streams.len()), 0, "reaped");
 }
 
+/// The Service hands its request body out of the task and responds; the body is dropped
+/// after the task ended, before the complete response was written (seen on quinn): the
+/// response is not reset; only reading stops (RFC 9114 §4.1).
+#[test]
+fn body_dropped_after_task_keeps_complete_response() {
+    let kept: Arc<Mutex<Option<RecvBody>>> = Arc::default();
+    let k = kept.clone();
+    let mut s = server(move |req: Request<RecvBody>| -> Fut {
+        *k.lock().unwrap() = Some(req.into_body());
+        Box::pin(async { respond(200, ChanBody::of(&[b"ok"])) })
+    });
+    s.net.block_writes(Side::Server, S0, true);
+    let shared = s.shared.clone();
+    let _srv = spawn(&s.exec, s.conn);
+    run(&s.exec, async {
+        let a = open(&mut s.peer, &req("POST", "/"), false).await;
+        settle(&mut s.peer).await;
+        // The task ended with its complete response queued but unwritten; the body lives.
+        shared.with(|i| {
+            let st = &i.streams[&a];
+            assert!(st.final_sent && !st.recv.task_owned && !st.send.done);
+        });
+        drop(kept.lock().unwrap().take());
+        settle(&mut s.peer).await;
+        s.net.block_writes(Side::Server, a, false);
+        let rc = H3Code::REQUEST_CANCELLED;
+        s.peer
+            .run_until(|p| finished(p, a) || aborted(p, a, rc))
+            .await;
+        assert!(finished(&s.peer, a), "the response was reset");
+        assert_eq!(s.peer.body(a), b"ok");
+        s.peer.send_body(a, b"", true); // the late FIN
+        settle(&mut s.peer).await;
+    });
+    assert!(!server_sent(&s.net, S0, H3Code::REQUEST_CANCELLED, false));
+    assert!(server_sent(&s.net, S0, H3Code::REQUEST_CANCELLED, true));
+    assert_eq!(s.shared.with(|i| i.streams.len()), 0, "reaped");
+}
+
 #[test]
 fn stop_sending_keeps_service_reading() {
     let got = Arc::new(Mutex::new(Vec::new()));

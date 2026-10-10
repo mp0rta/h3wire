@@ -469,19 +469,24 @@ impl Inner {
     /// left goes and it counts as consumed. Otherwise the stream is aborted with
     /// `H3_REQUEST_CANCELLED` in both directions (no receive-only abort), or, while a
     /// per-request task owns it, the queue goes, `abandoned` is set and the task commits
-    /// the abort when it ends.
+    /// the abort when it ends. After a server task ended with a complete response (not a
+    /// tunnel) still being written, the same holds and the abort waits for the response's
+    /// end, as `Commit` does (RFC 9114 §4.1).
     pub(crate) fn drop_reader(&mut self, id: StreamId) {
         let closed = self.close.is_some();
-        let Some(r) = self.streams.get_mut(&id).map(|s| &mut s.recv) else {
+        let Some(st) = self.streams.get_mut(&id) else {
             return;
         };
+        let responding = st.final_sent && matches!(st.up, Up::None) && !st.send.done;
+        let r = &mut st.recv;
         r.waker = None;
         r.consumer_waiting = false;
         if r.eof || r.error.is_some() || closed {
             r.trailers = None;
             self.discard_body(id);
-        } else if r.task_owned {
+        } else if r.task_owned || responding {
             r.abandoned = true;
+            st.abort_after_send |= !r.task_owned;
             self.discard_body(id);
         } else {
             self.abort_local(id, H3Code::REQUEST_CANCELLED);
