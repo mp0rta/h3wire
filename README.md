@@ -9,8 +9,17 @@ the transport, with no I/O, no async runtime and no dependencies beyond `std`
 Status: v0.1 core. It covers RFC 9114 request/response streams, control
 and QPACK streams, GOAWAY and stream termination, QPACK with the static table only
 (no dynamic table), Extended CONNECT (RFC 9220), the HTTP/3 part of HTTP Datagrams
-(RFC 9297) and extension points for frame, stream and setting types. There is no
-async layer or QUIC adapter yet.
+(RFC 9297) and extension points for frame, stream and setting types.
+
+## Crates
+
+| Crate | Description |
+|---|---|
+| `h3wire` | Sans-I/O HTTP/3 and QPACK core (no I/O, no runtime, no dependencies) |
+| `h3wire-async` | Runtime-neutral async layer: client, server, bodies, Extended CONNECT, datagrams. The `tokio` feature adds `TokioExecutor` |
+| `h3wire-quinn` | quinn 0.11 transport for `h3wire-async` |
+
+> **Note:** h3wire-async's API is unstable until the v0.3 MASQUE milestone: expect 0.x minor bumps; patches never break.
 
 ## Installation
 
@@ -20,7 +29,8 @@ Add the library with Cargo:
 cargo add h3wire
 ```
 
-Or add `h3wire = "0.1"` under `[dependencies]`.
+Or add `h3wire = "0.1"` under `[dependencies]`. For async HTTP/3 over quinn, add
+`h3wire-async` and `h3wire-quinn`.
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.

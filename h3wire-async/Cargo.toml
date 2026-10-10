@@ -14,7 +14,8 @@ categories = ["network-programming", "asynchronous"]
 [features]
 # Provides `rt::TokioExecutor`. The only way tokio enters the normal dependencies.
 tokio = ["dep:tokio"]
-# Test support for sibling crates (`__testing`); not public API.
+# UNSTABLE, internal-only: test support for this workspace's sibling crates
+# (`__testing` module). Not public API; may change or vanish in any release.
 __testing = []
 
 [dependencies]

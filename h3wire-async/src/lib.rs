@@ -4,6 +4,9 @@
 //!
 //! The QUIC transport is abstracted behind the poll-based traits in [`quic`]; the
 //! application supplies an [`rt::Executor`]. The API is unstable (0.x).
+//!
+//! The `__testing` feature exposes test support for this workspace's own crates; it is
+//! unstable, internal-only and not covered by any compatibility promise.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

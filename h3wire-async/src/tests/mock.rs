@@ -288,3 +288,21 @@ fn mock_write_never_yields_empty_chunks() {
     let w = ready(|cx| cs.poll_write_chunks(cx, &mut bufs)).unwrap();
     assert_eq!(w.bytes, 6);
 }
+
+#[cfg(feature = "tokio")]
+#[test]
+fn tokio_executor_runs_task() {
+    use crate::rt::{Executor, TokioExecutor};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = ran.clone();
+    rt.block_on(async move {
+        TokioExecutor.execute(Box::pin(async move { flag.store(true, Ordering::SeqCst) }));
+        // The spawned task runs when this one yields; no sleeps.
+        while !ran.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    });
+}
