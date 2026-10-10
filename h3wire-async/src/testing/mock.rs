@@ -141,6 +141,8 @@ struct Net {
     reorder: bool,
     early_wake: bool,
     trace: Vec<MockObs>,
+    /// One-shot hooks run right after an accepted write by (side, stream).
+    write_hooks: HashMap<(Side, StreamId), Box<dyn FnOnce() + Send>>,
 }
 
 fn register(slot: &mut Option<Waker>, cx: &Context<'_>) {
@@ -260,6 +262,7 @@ impl MockNet {
             reorder: false,
             early_wake: false,
             trace: Vec::new(),
+            write_hooks: HashMap::new(),
         })));
         let c = MockConn {
             net: net.clone(),
@@ -359,6 +362,13 @@ impl MockNet {
     /// The code `side` closed the connection with.
     pub fn closed_with(&self, side: Side) -> Option<u64> {
         self.lock().sides[side.idx()].closed
+    }
+
+    /// Run `f` once, right after the next write by `side` on `stream` is accepted and
+    /// outside the mock's lock: an action from another thread in the window between a
+    /// write and its accounting.
+    pub fn on_write(&self, side: Side, stream: StreamId, f: impl FnOnce() + Send + 'static) {
+        self.lock().write_hooks.insert((side, stream), Box::new(f));
     }
 
     /// Everything observed so far, in order.
@@ -589,6 +599,11 @@ impl SendStream for MockSend {
             stream: self.id,
             len: bytes,
         });
+        let hook = n.write_hooks.remove(&(self.side, self.id));
+        drop(n);
+        if let Some(f) = hook {
+            f();
+        }
         Poll::Ready(Ok(Written { bytes, chunks }))
     }
 

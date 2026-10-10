@@ -375,3 +375,70 @@ fn cancel_on_connection_close() {
         take(&late);
     });
 }
+
+/// Another thread aborts `s` between a transport write and its accounting (the core has
+/// reaped the stream by then): the driver must not panic, write nothing more of that
+/// frame, and the abort must reach the peer.
+fn abort_between_write_and_accounting(mid_body: bool) {
+    let mut c = client(1, |n| n.max_write(Some(1)));
+    let s = c.ids[0];
+    let aborted = PeerObs::Event(Event::StreamAborted {
+        stream: s,
+        code: H3Code::REQUEST_CANCELLED,
+        source: AbortSource::Peer,
+    });
+    let abort = {
+        let sh = c.shared.clone();
+        move || {
+            sh.with(|i| {
+                i.conn.abort(s, H3Code::REQUEST_CANCELLED).unwrap();
+                i.wake_driver();
+            })
+        }
+    };
+    if !mid_body {
+        // The first write on `s` is HEADERS: the `sent` path.
+        c.net.on_write(Side::Client, s, abort.clone());
+    }
+    run(&c.exec, async {
+        spawn_body_pipe(
+            c.shared.clone(),
+            s,
+            TestBody::data(&[&[7; 4_000]]),
+            &c.exec,
+            Owns::Send,
+        );
+        if mid_body {
+            // DATA prefix seen: the next write is payload, the `data_written` path.
+            c.peer.run_until(|p| frames(p, s).0.len() == 2).await;
+            c.net.on_write(Side::Client, s, abort);
+        }
+        for _ in 0..4 {
+            settle(&mut c.peer).await;
+        }
+    });
+    assert!(
+        c.peer.trace().contains(&aborted),
+        "driver survived; abort reached the peer"
+    );
+    let t = c.net.trace();
+    let reset = t
+        .iter()
+        .position(
+            |o| matches!(o, MockObs::Reset { side: Side::Client, stream, .. } if *stream == s),
+        )
+        .expect("RESET_STREAM sent");
+    let writes_after = t[reset..]
+        .iter()
+        .filter(|o| matches!(o, MockObs::Write { side: Side::Client, stream, .. } if *stream == s))
+        .count();
+    assert_eq!(writes_after, 0);
+    assert!(c.peer.body(s).len() < 4_000);
+    assert_eq!(fins(&c.net, s), 0);
+}
+
+#[test]
+fn concurrent_abort_between_write_and_accounting() {
+    abort_between_write_and_accounting(false);
+    abort_between_write_and_accounting(true);
+}

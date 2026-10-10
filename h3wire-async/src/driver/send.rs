@@ -92,17 +92,23 @@ impl<C: quic::Connection> Driver<C> {
             return Ok(false);
         }
         let complete = w.chunks == bufs.len();
-        self.shared.with(|i| {
+        let live = self.shared.with(|i| {
             let r = if data {
                 i.conn.data_written(id, w.bytes)
             } else {
                 i.conn.sent(id, w.bytes)
             };
-            // An Err is a state notification only (the core is closed).
-            debug_assert!(
-                matches!(r, Ok(()) | Err(UsageError::Closed(_))),
-                "write accounting: {r:?}"
-            );
+            match r {
+                Ok(()) => {}
+                // The core is closed, or another thread aborted the stream after this
+                // write was planned (the core reaped it): the stream's send side is over;
+                // its `ResetStream` runs next round. Anything else is an accounting bug.
+                Err(UsageError::Closed(_) | UsageError::UnknownStream) => return false,
+                Err(e) => {
+                    debug_assert!(false, "write accounting: {e:?}");
+                    return false;
+                }
+            }
             if data && complete {
                 // The frame is accounted: its payload leaves the queue.
                 if let Some(st) = i.streams.get_mut(&id).filter(|s| !s.send.done) {
@@ -112,8 +118,10 @@ impl<C: quic::Connection> Driver<C> {
                 }
             }
             i.push_ready(id, Dir::Send);
+            true
         });
-        if data && !complete {
+        // A dead stream's frame is dropped, never written further.
+        if live && data && !complete {
             bufs.drain(..w.chunks);
             self.frames.insert(id, bufs);
         }
