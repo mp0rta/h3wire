@@ -847,3 +847,34 @@ fn poll_ready_error_closes_internal_error() {
     assert_eq!(io.to_string(), "not ready");
     assert_eq!(s.net.closed_with(Side::Server), Some(0x102));
 }
+
+/// The test peer, like the driver, reads what the transport still holds before it
+/// treats a close as final: a response written before the close is seen whole.
+#[test]
+fn core_peer_reads_held_data_at_close() {
+    let mut s = server(|_| -> Fut { Box::pin(async { respond(200, ChanBody::of(&[b"ok"])) }) });
+    s.net.readable_after_close(true);
+    let get = req("GET", "/");
+    let (net, peer, conn) = (&s.net, &mut s.peer, &mut s.conn);
+    run(&s.exec, async {
+        let b = open(peer, &get, true).await;
+        let fin = |side| MockObs::Fin { side, stream: b };
+        peer.run_until(|_| net.trace().contains(&fin(Side::Client)))
+            .await;
+        // Only the server runs until its response is written; the peer does not read.
+        let fin = fin(Side::Server);
+        poll_fn(|cx| {
+            let _ = Pin::new(&mut *conn).poll(cx);
+            if net.trace().contains(&fin) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        net.kill_transport(Side::Client, Some(0x100));
+        settle(peer).await;
+        assert!(finished(peer, b), "{:?}", peer.trace());
+        assert_eq!(peer.body(b), b"ok");
+    });
+}

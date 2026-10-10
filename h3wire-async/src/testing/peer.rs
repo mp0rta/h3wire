@@ -12,7 +12,7 @@ use h3wire::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 /// One observation of a [`CorePeer`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,8 +280,13 @@ impl<C: Quic> CorePeer<C> {
         }
     }
 
+    /// The transport failed: like the driver, first read what it still holds (a peer may
+    /// close right after its last bytes were acknowledged), then close the core.
     fn transport_closed(&mut self) {
-        self.dead = true;
+        if std::mem::replace(&mut self.dead, true) {
+            return;
+        }
+        self.read(&mut Context::from_waker(Waker::noop()));
         self.core.transport_closed();
         self.events();
     }
@@ -483,6 +488,10 @@ impl<C: Quic> CorePeer<C> {
                         self.recvs.remove(&s);
                         self.inbox.remove(&s);
                         let _ = self.core.stream_reset_received(s, H3Code(code));
+                    }
+                    // While closing: nothing more is held on this stream.
+                    Err(ReadError::Transport(_)) if self.dead => {
+                        self.recvs.remove(&s);
                     }
                     Err(ReadError::Transport(_)) => {
                         self.transport_closed();
