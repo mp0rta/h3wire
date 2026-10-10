@@ -1,4 +1,4 @@
 [workspace]
-members = ["h3wire"]
+members = ["h3wire", "h3wire-async"]
 exclude = ["fuzz"]
 resolver = "3"
