@@ -209,18 +209,6 @@ where
     pub async fn settings(&self) -> Option<PeerSettings> {
         ConnInfo::new(self.shared.clone()).settings().await
     }
-
-    /// See `ConnInfo::__debug_recv_accounting`. Not public API.
-    #[doc(hidden)]
-    pub fn __debug_recv_accounting(&self) -> (usize, usize, usize) {
-        ConnInfo::new(self.shared.clone()).__debug_recv_accounting()
-    }
-
-    /// See `ConnInfo::__debug_datagram_accounting`. Not public API.
-    #[doc(hidden)]
-    pub fn __debug_datagram_accounting(&self) -> (usize, usize, usize) {
-        ConnInfo::new(self.shared.clone()).__debug_datagram_accounting()
-    }
 }
 
 /// A request's HEADERS, whether they end the stream, and its body pipe; whether it is a

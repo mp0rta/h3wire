@@ -111,18 +111,6 @@ impl<C: quic::Connection, S, E> ServerConnection<C, S, E> {
             i.wake_driver();
         });
     }
-
-    /// See `ConnInfo::__debug_recv_accounting`. Not public API.
-    #[doc(hidden)]
-    pub fn __debug_recv_accounting(&self) -> (usize, usize, usize) {
-        ConnInfo::new(self.driver.shared()).__debug_recv_accounting()
-    }
-
-    /// See `ConnInfo::__debug_datagram_accounting`. Not public API.
-    #[doc(hidden)]
-    pub fn __debug_datagram_accounting(&self) -> (usize, usize, usize) {
-        ConnInfo::new(self.driver.shared()).__debug_datagram_accounting()
-    }
 }
 
 impl<C, S, B, E> ServerConnection<C, S, E>

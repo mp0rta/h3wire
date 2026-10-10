@@ -2,9 +2,13 @@
 // Copyright (c) 2026 mp0rta
 //! Request/response extensions.
 
-use crate::state::{Shared, charge};
+use crate::state::Shared;
+#[cfg(test)]
+use crate::state::charge;
 use bytes::Bytes;
-use h3wire::{PeerSettings, StreamId};
+use h3wire::PeerSettings;
+#[cfg(test)]
+use h3wire::StreamId;
 use std::future::poll_fn;
 use std::task::Poll;
 
@@ -29,10 +33,10 @@ impl Protocol {
     }
 }
 
-/// One stream's buffers, from `ConnInfo::__debug_buffers`. Not public API.
-#[doc(hidden)]
+/// One stream's buffers, from `ConnInfo::__debug_buffers` (tests).
+#[cfg(test)]
 #[derive(Clone, Debug)]
-pub struct DebugStream {
+pub(crate) struct DebugStream {
     /// The stream.
     pub id: StreamId,
     /// Raw bytes read but not fed to the core.
@@ -70,9 +74,9 @@ impl ConnInfo {
     }
 
     /// Receive accounting for the bound oracle: (queued body bytes as charged, streams
-    /// holding a demand reservation, retained raw bytes). Not public API.
-    #[doc(hidden)]
-    pub fn __debug_recv_accounting(&self) -> (usize, usize, usize) {
+    /// holding a demand reservation, retained raw bytes).
+    #[cfg(test)]
+    pub(crate) fn __debug_recv_accounting(&self) -> (usize, usize, usize) {
         self.shared.with(|i| {
             let r = i.streams.values().map(|s| &s.recv);
             (
@@ -84,9 +88,9 @@ impl ConnInfo {
     }
 
     /// Datagram accounting for the bound oracle: (datagrams in registered queues, pending
-    /// datagrams, pending bytes). Not public API.
-    #[doc(hidden)]
-    pub fn __debug_datagram_accounting(&self) -> (usize, usize, usize) {
+    /// datagrams, pending bytes).
+    #[cfg(test)]
+    pub(crate) fn __debug_datagram_accounting(&self) -> (usize, usize, usize) {
         self.shared.with(|i| {
             let queued = i.streams.values().map(|s| s.dgram.queue.len()).sum();
             (queued, i.dgram.pending.len(), i.dgram.pending_bytes)
@@ -94,9 +98,9 @@ impl ConnInfo {
     }
 
     /// Per-stream buffers for the bound oracle, one entry per stream with any state, plus
-    /// the datagrams queued for the transport. Not public API.
-    #[doc(hidden)]
-    pub fn __debug_buffers(&self) -> (Vec<DebugStream>, usize) {
+    /// the datagrams queued for the transport.
+    #[cfg(test)]
+    pub(crate) fn __debug_buffers(&self) -> (Vec<DebugStream>, usize) {
         self.shared.with(|i| {
             let mut ids: Vec<StreamId> =
                 i.streams.keys().chain(i.retained.keys()).copied().collect();
