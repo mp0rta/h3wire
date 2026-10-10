@@ -43,6 +43,7 @@ impl Builder {
         E: Executor<BoxTask>,
     {
         let driver = Driver::new(conn, Role::Client, self);
+        driver.shared().with(|i| i.senders = 1);
         let send = SendRequest {
             shared: driver.shared(),
             exec: BoxExec(Arc::new(move |t| exec.execute(t))),
@@ -63,6 +64,10 @@ impl Executor<BoxTask> for BoxExec {
 }
 
 /// Sends requests on a client connection; `Clone`.
+///
+/// Dropping the last clone starts the connection's graceful shutdown (as
+/// [`ClientConnection::graceful_shutdown`]): requests already sent complete, then the
+/// driver closes with `H3_NO_ERROR` and resolves `Ok`.
 pub struct SendRequest<B> {
     pub(crate) shared: Shared,
     exec: BoxExec,
@@ -71,11 +76,24 @@ pub struct SendRequest<B> {
 
 impl<B> Clone for SendRequest<B> {
     fn clone(&self) -> Self {
+        self.shared.with(|i| i.senders += 1);
         SendRequest {
             shared: self.shared.clone(),
             exec: self.exec.clone(),
             _body: PhantomData,
         }
+    }
+}
+
+impl<B> Drop for SendRequest<B> {
+    fn drop(&mut self) {
+        self.shared.with(|i| {
+            i.senders -= 1;
+            if i.senders == 0 {
+                i.graceful = true;
+                i.wake_driver();
+            }
+        });
     }
 }
 
@@ -418,8 +436,8 @@ impl Drop for InFlight {
 }
 
 /// The client connection's driver: a future to spawn on the executor. It resolves `Ok`
-/// on a clean close (graceful shutdown, or the peer closing with `H3_NO_ERROR` or with
-/// the transport's `NO_ERROR`). When the transport fails, responses it already holds are
+/// on a clean close (graceful shutdown, which dropping every [`SendRequest`] also starts,
+/// or the peer closing with `H3_NO_ERROR` or with the transport's `NO_ERROR`). When the transport fails, responses it already holds are
 /// delivered before the close. Dropping it closes the connection with `H3_NO_ERROR`.
 pub struct ClientConnection<C: quic::Connection> {
     driver: Driver<C>,

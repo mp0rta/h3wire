@@ -13,9 +13,10 @@
 //! when it had trailers. The request body is `N` bytes of `b'a'`. The server's
 //! certificate must chain to `--ca`.
 //!
-//! The connection always ends with a graceful shutdown (GOAWAY, then `H3_NO_ERROR`).
-//! With `--goaway` it starts as soon as every response's HEADERS arrived, with the
-//! bodies still in flight; otherwise once the bodies are read.
+//! The connection always ends with a graceful shutdown (no new requests, then
+//! `H3_NO_ERROR`), started by dropping the `SendRequest`. With `--goaway` it starts as
+//! soon as every response's HEADERS arrived, with the bodies still in flight; otherwise
+//! once the bodies are read.
 //!
 //! Exits non-zero on an error, a non-2xx status, a hash other than `--expect-sha256`,
 //! or a connection that does not close cleanly.
@@ -34,13 +35,10 @@ use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::{self, RootCertStore, crypto::ring};
 use sha2::{Digest, Sha256};
-use std::future::{Future, poll_fn};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 
 type Body = UnsyncBoxBody<Bytes, BoxError>;
 
@@ -129,15 +127,10 @@ async fn run() -> Result<bool, BoxError> {
     endpoint.set_default_client_config(cc);
     let conn = endpoint.connect(addr, &host)?.await?;
 
-    let (mut send, mut driver) =
+    let (mut send, driver) =
         h3wire_quinn::client::<Body, _>(conn, &Builder::new(), TokioExecutor).await?;
-    let (shutdown, mut stop) = oneshot::channel::<()>();
-    let driver = tokio::spawn(poll_fn(move |cx| {
-        if !stop.is_terminated() && Pin::new(&mut stop).poll(cx).is_ready() {
-            Pin::new(&mut driver).graceful_shutdown();
-        }
-        Pin::new(&mut driver).poll(cx)
-    }));
+    // Dropping the last `SendRequest` starts the graceful shutdown.
+    let driver = tokio::spawn(driver);
 
     let method: Method = match &a.method {
         Some(m) => m.parse()?,
@@ -158,9 +151,9 @@ async fn run() -> Result<bool, BoxError> {
     for h in heads {
         resps.push(h.await?);
     }
-    let mut shutdown = Some(shutdown);
+    let mut send = Some(send);
     if a.goaway {
-        let _ = shutdown.take().unwrap().send(());
+        send = None;
     }
 
     let mut ok = true;
@@ -194,9 +187,7 @@ async fn run() -> Result<bool, BoxError> {
         }
     }
 
-    if let Some(s) = shutdown {
-        let _ = s.send(());
-    }
+    drop(send);
     match tokio::time::timeout(Duration::from_secs(10), driver).await {
         Ok(r) => r?.map_err(|e: Error| format!("connection: {e}"))?,
         Err(_) => return Err("graceful shutdown timed out".into()),

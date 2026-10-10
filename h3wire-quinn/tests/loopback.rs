@@ -706,3 +706,29 @@ async fn response_acked_before_close_is_delivered() {
     })
     .await;
 }
+
+/// Dropping every `SendRequest` ends the client connection once the request in flight
+/// completes: it closes with `H3_NO_ERROR`, and both drivers resolve `Ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_senders_closes_after_in_flight() {
+    with_timeout(async {
+        let (svc, mut reqs) = handoff();
+        let Pair {
+            mut send,
+            client,
+            server,
+            conns: _conns,
+        } = pair(svc).await;
+        let a = tokio::spawn(send.send_request(get("/a")));
+        drop(send);
+        let (_req, tx) = reqs.recv().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!client.is_finished(), "a request is in flight");
+        tx.send(reply(200, full("done"))).unwrap();
+        let r = a.await.unwrap().unwrap();
+        assert_eq!(collect(r.into_body()).await.unwrap().0, "done");
+        client.await.unwrap().expect("client: a clean close");
+        server.done.await.unwrap().expect("server: a clean close");
+    })
+    .await
+}

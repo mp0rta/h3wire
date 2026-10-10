@@ -658,3 +658,53 @@ fn data_held_by_transport_at_peer_close_is_delivered() {
         conn.await.expect("the peer closed with H3_NO_ERROR");
     });
 }
+
+/// Dropping the last `SendRequest` starts a graceful shutdown: with nothing in flight
+/// the driver resolves `Ok` and closes with `H3_NO_ERROR`; a live clone keeps it open.
+#[test]
+fn dropping_every_sender_closes_idle_connection() {
+    let (net, send, conn, mut peer, exec) = client::<String>(&Builder::new(), Config::default());
+    let drv = spawn(&exec, conn);
+    let clone = send.clone();
+    drop(send);
+    run(&exec, settle(&mut peer));
+    assert!(!done(&drv), "a clone is alive");
+    drop(clone);
+    run(&exec, settle(&mut peer));
+    assert!(done(&drv), "the driver ended");
+    take(&drv).expect("a clean close");
+    assert_eq!(net.closed_with(Side::Client), Some(0x100));
+}
+
+/// With a request in flight, the driver of a client whose senders are all gone waits
+/// for it, then closes cleanly.
+#[test]
+fn dropping_every_sender_waits_in_flight() {
+    let (net, mut send, conn, mut peer, exec) =
+        client::<String>(&Builder::new(), Config::default());
+    let drv = spawn(&exec, conn);
+    run(&exec, async {
+        let r = spawn(
+            &exec,
+            send.send_request(req(Method::POST, "https://a/", "abc".into())),
+        );
+        peer.run_until(|p| finished(p, S0)).await;
+        drop(send);
+        for _ in 0..4 {
+            settle(&mut peer).await;
+        }
+        assert!(!done(&drv), "a request is in flight");
+        assert_eq!(net.closed_with(Side::Client), None);
+        peer.send_headers(S0, &[(":status", "200")], false).unwrap();
+        peer.send_body(S0, b"done", true);
+        peer.run_until(|_| done(&r)).await;
+        let mut body = take(&r).unwrap().into_body();
+        assert_eq!(collect(&mut peer, &mut body).await.0, b"done");
+        for _ in 0..4 {
+            settle(&mut peer).await;
+        }
+        assert!(done(&drv), "the driver ended");
+    });
+    take(&drv).expect("a clean close");
+    assert_eq!(net.closed_with(Side::Client), Some(0x100));
+}

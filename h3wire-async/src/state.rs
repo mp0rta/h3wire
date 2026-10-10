@@ -272,6 +272,8 @@ pub(crate) struct Inner {
     pub peer_goaway: bool,
     /// Graceful shutdown started: no new requests; the driver closes once drained.
     pub graceful: bool,
+    /// Client: live `SendRequest` clones; the last one gone starts graceful shutdown.
+    pub senders: usize,
     pub streams: HashMap<StreamId, StreamState>,
     /// Server: streams whose request head was delivered, waiting for dispatch.
     pub incoming: VecDeque<StreamId>,
@@ -645,6 +647,7 @@ impl Shared {
             next_open: 0,
             peer_goaway: false,
             graceful: false,
+            senders: 0,
             streams: HashMap::new(),
             incoming: VecDeque::new(),
             ready: VecDeque::new(),
