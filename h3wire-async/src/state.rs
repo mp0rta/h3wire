@@ -71,6 +71,10 @@ pub(crate) struct StreamState {
     pub task_failed: bool,
     /// Server: the request carries `expect: 100-continue`, not answered yet.
     pub expect_continue: bool,
+    /// Server: the task ended with its body abandoned before the end while the response
+    /// was still going out. The `H3_REQUEST_CANCELLED` abort waits for the send side to
+    /// end, so a complete response is not reset (only reading stops, RFC 9114 §4.1).
+    pub abort_after_send: bool,
     /// The upgrade of a CONNECT (spec §4.5).
     pub up: Up,
     /// HTTP datagrams (spec §3.4).
@@ -108,6 +112,7 @@ impl StreamState {
             final_sent: false,
             task_failed: false,
             expect_continue: false,
+            abort_after_send: false,
             up: Up::None,
             dgram: DgramState::default(),
         }
@@ -393,6 +398,7 @@ impl Inner {
     /// The send side of `id` is over (finished, stopped, reset or aborted): drop what is
     /// queued, release the producer, fire the tokens.
     pub(crate) fn send_terminal(&mut self, id: StreamId) {
+        let mut abort = false;
         if let Some(st) = self.streams.get_mut(&id) {
             self.pending_wakers.extend(st.send.waker.take());
             st.send = SendState {
@@ -401,6 +407,10 @@ impl Inner {
                 error: st.send.error.take(),
                 ..SendState::default()
             };
+            abort = std::mem::take(&mut st.abort_after_send) && !st.recv_terminal();
+        }
+        if abort {
+            self.abort_local(id, H3Code::REQUEST_CANCELLED);
         }
         self.fire_cancels(id);
     }

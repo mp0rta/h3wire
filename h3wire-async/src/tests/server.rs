@@ -429,6 +429,8 @@ fn response_body_error_after_final_headers_is_internal_error() {
     body_failure_after_final_headers("panic");
 }
 
+/// The request body is dropped unfinished: once the complete response went out, reading
+/// stops with `H3_REQUEST_CANCELLED`; the response is not reset.
 #[test]
 fn dropped_body_after_response_is_request_cancelled() {
     let (tx, body) = ChanBody::new();
@@ -449,12 +451,40 @@ fn dropped_body_after_response_is_request_cancelled() {
         s.peer.run_until(|p| p.body(a) == b"x").await;
         assert_eq!(statuses(&s.peer, a), ["200"]);
         drop(tx); // the response ends: the task ends
+        let rc = H3Code::REQUEST_CANCELLED;
         s.peer
-            .run_until(|p| aborted(p, a, H3Code::REQUEST_CANCELLED))
+            .run_until(|p| finished(p, a) || aborted(p, a, rc))
+            .await;
+        assert!(finished(&s.peer, a), "the response was reset");
+        assert_eq!(s.peer.body(a), b"x");
+        s.peer
+            .run_until(|_| server_sent(&s.net, S0, rc, true))
             .await;
     });
-    assert!(server_sent(&s.net, S0, H3Code::REQUEST_CANCELLED, true));
+    assert!(!server_sent(&s.net, S0, H3Code::REQUEST_CANCELLED, false));
     assert!(!server_sent(&s.net, S0, H3Code::INTERNAL_ERROR, false));
+}
+
+/// A GET whose FIN is still in flight when its Service drops the request (seen on quinn):
+/// the complete response is not reset; only reading stops (RFC 9114 §4.1).
+#[test]
+fn ignored_request_body_keeps_complete_response() {
+    let mut s = server(|_| -> Fut { Box::pin(async { respond(200, ChanBody::of(&[b"ok"])) }) });
+    let _srv = spawn(&s.exec, s.conn);
+    run(&s.exec, async {
+        let a = open(&mut s.peer, &req("GET", "/"), false).await;
+        let rc = H3Code::REQUEST_CANCELLED;
+        s.peer
+            .run_until(|p| finished(p, a) || aborted(p, a, rc))
+            .await;
+        assert!(finished(&s.peer, a), "the response was reset");
+        assert_eq!(s.peer.body(a), b"ok");
+        s.peer.send_body(a, b"", true); // the late FIN
+        settle(&mut s.peer).await;
+    });
+    assert!(!server_sent(&s.net, S0, H3Code::REQUEST_CANCELLED, false));
+    assert!(server_sent(&s.net, S0, H3Code::REQUEST_CANCELLED, true));
+    assert_eq!(s.shared.with(|i| i.streams.len()), 0, "reaped");
 }
 
 #[test]

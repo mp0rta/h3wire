@@ -335,7 +335,8 @@ impl Commit {
     /// The task is over: release its ownership and abort with the code its outcome
     /// calls for (spec §4.6, plan "Abort codes inside the task"):
     /// 1. `H3_INTERNAL_ERROR` if it failed: no final response, or the body pipe failed;
-    /// 2. else `H3_REQUEST_CANCELLED` if its `RecvBody` was dropped before the end.
+    /// 2. else `H3_REQUEST_CANCELLED` if its `RecvBody` was dropped before the end, once
+    ///    the response side has ended (`abort_after_send`).
     ///
     /// A cancelled task's response side is over, so its abort only acts on the request
     /// side: a no-op once the request ended, else (its body was dropped before FIN, so no
@@ -352,7 +353,9 @@ impl Commit {
             let code = if st.task_failed || no_response {
                 Some(H3Code::INTERNAL_ERROR)
             } else if st.recv.abandoned && !st.recv_terminal() {
-                Some(H3Code::REQUEST_CANCELLED)
+                // A response still going out is not reset: the abort waits for its end.
+                st.abort_after_send = !st.send.done;
+                st.send.done.then_some(H3Code::REQUEST_CANCELLED)
             } else {
                 None
             };
