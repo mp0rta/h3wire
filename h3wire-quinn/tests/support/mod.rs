@@ -37,11 +37,19 @@ pub type Peer = CorePeer<QuinnConnection>;
 /// A server and a client endpoint on loopback (ephemeral ports), with an rcgen
 /// self-signed certificate for `localhost` and datagrams enabled; the server's address.
 pub fn endpoint_pair() -> (Endpoint, Endpoint, SocketAddr) {
+    endpoint_pair_with(|_| {})
+}
+
+/// [`endpoint_pair`], with `f` applied to both endpoints' transport config.
+pub fn endpoint_pair_with(
+    f: impl FnOnce(&mut quinn::TransportConfig),
+) -> (Endpoint, Endpoint, SocketAddr) {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert: CertificateDer<'static> = ck.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der());
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(1 << 16));
+    f(&mut transport);
     let transport = Arc::new(transport);
     let mut sc = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
     sc.transport_config(transport.clone());
@@ -64,7 +72,12 @@ pub struct Conns {
 }
 
 pub async fn connect() -> Conns {
-    let (se, ce, addr) = endpoint_pair();
+    connect_with(|_| {}).await
+}
+
+/// [`connect`], with `f` applied to the transport config.
+pub async fn connect_with(f: impl FnOnce(&mut quinn::TransportConfig)) -> Conns {
+    let (se, ce, addr) = endpoint_pair_with(f);
     let (server, client) =
         tokio::join!(async { se.accept().await.unwrap().await.unwrap() }, async {
             ce.connect(addr, "localhost").unwrap().await.unwrap()
@@ -304,8 +317,19 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let conns = connect().await;
-    let server = spawn_server(conns.server.clone(), &Builder::new(), service);
+    pair_with(connect().await, &Builder::new(), service).await
+}
+
+/// [`pair`] over `conns`, the server built by `sb`.
+pub async fn pair_with<S>(conns: Conns, sb: &Builder, service: S) -> Pair
+where
+    S: Service<Request<RecvBody>, Response = Response<BoxBody>, Error = BoxError>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let server = spawn_server(conns.server.clone(), sb, service);
     let (send, conn) = h3wire_quinn::client(conns.client.clone(), &Builder::new(), TokioExecutor)
         .await
         .unwrap();
