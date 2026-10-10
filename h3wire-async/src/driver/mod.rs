@@ -372,8 +372,9 @@ impl<C: quic::Connection> Driver<C> {
     }
 }
 
-/// Drain the core's events into per-stream state.
-fn dispatch_events(i: &mut Inner) {
+/// Drain the core's events into per-stream state. Handles may call it right after a
+/// local `abort`, so both halves see the abort at once.
+pub(crate) fn dispatch_events(i: &mut Inner) {
     while let Some(e) = i.conn.poll_event() {
         let retryable = e.retryable();
         match e {
@@ -434,22 +435,27 @@ fn dispatch_events(i: &mut Inner) {
                     // round having moved.
                     i.wake_driver();
                 }
+                let e: Error = ErrorKind::StreamAborted {
+                    code,
+                    source,
+                    retryable,
+                }
+                .into();
                 if let Some(st) = i.streams.get_mut(&stream) {
                     st.recv.trailers = None;
-                    st.recv.error = Some(
-                        ErrorKind::StreamAborted {
-                            code,
-                            source,
-                            retryable,
-                        }
-                        .into(),
-                    );
+                    st.recv.error = Some(e.clone());
+                    // A whole-stream abort ends the send side too.
+                    st.send.error = Some(e);
                     i.pending_wakers.extend(st.recv.waker.take());
                 }
-                // A whole-stream abort ends the send side too.
                 i.send_terminal(stream);
             }
-            Event::SendStopped { stream, .. } => i.send_terminal(stream),
+            Event::SendStopped { stream, code } => {
+                if let Some(st) = i.streams.get_mut(&stream) {
+                    st.send.error = Some(ErrorKind::SendStopped { code }.into());
+                }
+                i.send_terminal(stream);
+            }
             // Client: requests above the cutoff are aborted by the core (retryable);
             // queued ones never start. (Server: a push ID, no effect.)
             Event::GoAway { .. } => {

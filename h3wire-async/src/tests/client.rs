@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
-use super::driver::{Out, done, poll_once, spawn, take};
+use super::driver::{done, poll_once, spawn, take};
 use super::recv::{headers_frame, next_frame, settle};
 use super::send::{TestBody, finished};
 use crate::__testing::exec::{TestExec, run};
@@ -10,16 +10,17 @@ use crate::builder::Builder;
 use crate::client::{ClientConnection, SendRequest};
 use crate::error::{BoxError, Error, ErrorKind};
 use crate::ext::Protocol;
-use bytes::Bytes;
+use crate::upgrade;
 use h3wire::{AbortSource, Config, H3Code, Role, StreamId, UsageError};
 use http::{Method, Request, Response};
-use http_body::{Body, Frame};
+use http_body::Body;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::Poll;
 
 const S0: StreamId = StreamId(0);
 const S4: StreamId = StreamId(4);
+const S8: StreamId = StreamId(8);
 
 type Peer = CorePeer<MockConn>;
 type Resp = Result<Response<RecvBody>, Error>;
@@ -483,18 +484,17 @@ fn peer_bidi_stream_is_connection_error() {
     assert_eq!(net.closed_with(Side::Client), Some(0x103));
 }
 
-type Frm = Option<Result<Frame<Bytes>, Error>>;
-
 /// Live handles of every kind when `fail` strikes: the driver, a live `RecvBody`, a
-/// `send_request` waiting for its response and one waiting for stream credit.
+/// `send_request` waiting for its response, a `Tunnel` waiting to receive, and one
+/// `send_request` waiting for stream credit. The tunnel's error comes last in the list.
 fn every_handle(
     fail: impl FnOnce(&MockNet, &mut Peer),
 ) -> (Result<(), Error>, ErrorKind, Vec<ErrorKind>) {
     let (net, mut send, conn, mut peer, exec) =
         client::<String>(&Builder::new(), Config::default());
-    net.max_bidi_streams(Side::Client, 2);
+    net.max_bidi_streams(Side::Client, 3);
     let drv = spawn(&exec, conn);
-    let (body, pending): (Out<Frm>, Vec<Out<Resp>>) = run(&exec, async {
+    let (body, pending, tunnel) = run(&exec, async {
         let a = spawn(&exec, send.send_request(get("https://a/a")));
         peer.run_until(|p| seen(p, S0)).await;
         peer.send_headers(S0, &[(":status", "200")], false).unwrap();
@@ -505,16 +505,29 @@ fn every_handle(
         });
         let b = spawn(&exec, send.send_request(get("https://a/b")));
         peer.run_until(|p| seen(p, S4)).await;
+        let t = spawn(
+            &exec,
+            send.send_request(req(Method::CONNECT, "a:443", String::new())),
+        );
+        peer.run_until(|p| seen(p, S8)).await;
+        peer.send_headers(S8, &[(":status", "200")], false).unwrap();
+        peer.run_until(|_| done(&t)).await;
+        let mut resp = take(&t).unwrap();
+        let tunnel = spawn(&exec, async move {
+            let mut t = upgrade::on(&mut resp).await.expect("a tunnel");
+            t.recv().await
+        });
         let c = spawn(&exec, send.send_request(get("https://a/c")));
         settle(&mut peer).await;
-        assert!(!done(&body) && !done(&b) && !done(&c) && !done(&drv));
+        assert!(!done(&body) && !done(&b) && !done(&c) && !done(&tunnel) && !done(&drv));
         fail(&net, &mut peer);
-        peer.run_until(|_| done(&drv) && done(&body) && done(&b) && done(&c))
-            .await;
-        (body, vec![b, c])
+        let all = |_: &Peer| done(&drv) && done(&body) && done(&b) && done(&c) && done(&tunnel);
+        peer.run_until(all).await;
+        (body, vec![b, c], tunnel)
     });
     let body = take(&body).expect("a frame").unwrap_err().kind().clone();
-    let pending = pending.iter().map(|o| err_kind(take(o))).collect();
+    let mut pending: Vec<_> = pending.iter().map(|o| err_kind(take(o))).collect();
+    pending.push(take(&tunnel).expect_err("must fail").kind().clone());
     (take(&drv), body, pending)
 }
 

@@ -5,14 +5,16 @@
 use crate::body::{RecvBody, pipe_body};
 use crate::builder::Builder;
 use crate::driver::Driver;
-use crate::error::{BoxError, Error};
+use crate::error::{BoxError, Error, ErrorKind};
 use crate::ext::ConnInfo;
 use crate::http_map::{request_from_block, response_fields};
 use crate::quic;
 use crate::rt::{BoxTask, CancelToken, Cancelable, Executor, Owns};
+use crate::slot::OnceSlot;
 use crate::state::{Dir, Inner, Shared, assert_unlocked};
+use crate::upgrade::{Claim, UpgradeCell, settle};
 use bytes::Buf;
-use h3wire::{H3Code, Role, StreamId};
+use h3wire::{H3Code, Role, StreamId, UsageError};
 use http::header::EXPECT;
 use http::{Method, Request, Response, StatusCode};
 use http_body::Body;
@@ -152,10 +154,17 @@ where
             };
             let mut req = req.map(|()| RecvBody::new(shared.clone(), id));
             req.extensions_mut().insert(ConnInfo::new(shared.clone()));
-            // Further request extensions go here (Task 8: upgrade; Task 9: datagrams).
+            let connect = req.method() == Method::CONNECT;
+            if connect {
+                // Its user was counted by `next_request`.
+                let claim = Claim::new(shared.clone(), id);
+                req.extensions_mut()
+                    .insert(UpgradeCell(OnceSlot::new(claim)));
+            }
+            // Further request extensions go here (Task 9: datagrams).
             let head = req.method() == Method::HEAD;
             let fut = self.service.call(req);
-            task.fut = Some(Box::pin(respond(shared.clone(), id, head, fut)));
+            task.fut = Some(Box::pin(respond(shared.clone(), id, head, connect, fut)));
             self.exec
                 .execute(Box::pin(Cancelable::new(Box::pin(task), token)));
         }
@@ -163,7 +172,8 @@ where
 }
 
 /// The next delivered request: its head is released, and its entry gains two users (the
-/// `RecvBody` and the task), the task's ownership and its cancel token.
+/// `RecvBody` and the task; a CONNECT's upgrade claim is a third), the task's ownership
+/// and its cancel token.
 fn next_request(i: &mut Inner) -> Option<(StreamId, Request<()>, CancelToken)> {
     while let Some(id) = i.incoming.pop_front() {
         // None: aborted (and reaped) before dispatch.
@@ -184,7 +194,11 @@ fn next_request(i: &mut Inner) -> Option<(StreamId, Request<()>, CancelToken)> {
             Err(_) => continue,
         };
         let st = i.streams.get_mut(&id).expect("checked above");
-        st.users += 2;
+        st.users += if req.method() == Method::CONNECT {
+            3
+        } else {
+            2
+        };
         st.recv.task_owned = true;
         st.expect_continue = req
             .headers()
@@ -199,7 +213,11 @@ fn next_request(i: &mut Inner) -> Option<(StreamId, Request<()>, CancelToken)> {
 /// The per-request task body: the Service future, the response HEADERS, the body pipe.
 /// Failures are only recorded here (`final_sent` stays false, or `task_failed`); `Commit`
 /// turns them into the abort.
-async fn respond<F, B, Er>(shared: Shared, id: StreamId, head: bool, fut: F)
+///
+/// A 2xx to a CONNECT goes without FIN and without a pipe: the tunnel sends. Its body
+/// must be empty, else the stream is aborted with `H3_INTERNAL_ERROR` (no final response)
+/// and the claim's `OnUpgrade` sees `Usage` (spec §4.5).
+async fn respond<F, B, Er>(shared: Shared, id: StreamId, head: bool, connect: bool, fut: F)
 where
     F: Future<Output = Result<Response<B>, Er>>,
     B: Body,
@@ -210,6 +228,12 @@ where
     };
     let (parts, body) = resp.into_parts();
     let fields = response_fields(&parts);
+    let tunnel = connect && parts.status.is_success();
+    if tunnel && !body.is_end_stream() {
+        let e = ErrorKind::Usage(UsageError::WrongPhase).into();
+        shared.with(|i| settle(i, id, Err(e)));
+        return;
+    }
     // HEAD, 204 and 304 carry no content: the body is dropped unpolled (the core would
     // refuse its DATA).
     let no_content = head
@@ -217,7 +241,9 @@ where
             parts.status,
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
         );
-    let end = no_content || body.is_end_stream();
+    let end = !tunnel && (no_content || body.is_end_stream());
+    // What the claim's `OnUpgrade` resolves to.
+    let not_upgraded = || ErrorKind::NotUpgraded.into();
     let pipe = shared.with(|i| {
         let Some(st) = i.streams.get_mut(&id) else {
             return false;
@@ -225,6 +251,9 @@ where
         if st.send.done {
             // The peer stopped the response (or the stream ended): nothing to send.
             st.final_sent = true;
+            if connect {
+                settle(i, id, Err(not_upgraded()));
+            }
             return false;
         }
         // Err (an invalid response): `final_sent` stays false.
@@ -235,7 +264,10 @@ where
             st.final_sent = true;
         }
         i.mark_ready(id, Dir::Send);
-        !end
+        if connect {
+            settle(i, id, if tunnel { Ok(()) } else { Err(not_upgraded()) });
+        }
+        !end && !tunnel
     });
     if pipe && pipe_body(&shared, id, body).await.is_err() {
         set_failed(&shared, id);

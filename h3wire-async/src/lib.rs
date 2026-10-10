@@ -31,6 +31,7 @@ mod slot;
 mod state;
 #[cfg(test)]
 mod tests;
+pub mod upgrade;
 
 pub use builder::Builder;
 pub use client::{ClientConnection, SendRequest};

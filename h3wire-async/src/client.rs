@@ -11,7 +11,9 @@ use crate::ext::{ConnInfo, Protocol};
 use crate::http_map::{Fields, request_fields, response_from_block};
 use crate::quic;
 use crate::rt::{BoxTask, Executor, Owns};
+use crate::slot::OnceSlot;
 use crate::state::{Dir, Inner, OnOpen, Open, Shared};
+use crate::upgrade::{Claim, PendingUpgrade, connect_response};
 use bytes::Buf;
 use h3wire::{AbortSource, H3Code, PeerSettings, Role, StreamId, UsageError};
 use http::{Method, Request, Response};
@@ -128,6 +130,8 @@ where
     /// - With a [`Protocol`] extension (Extended CONNECT) the future first waits for the
     ///   peer's SETTINGS (only then is the request queued), and fails with
     ///   `Usage(NotNegotiated)` unless the peer enabled it.
+    /// - A CONNECT is sent without FIN. A 2xx response carries the tunnel: take it with
+    ///   [`upgrade::on`](crate::upgrade::on). Any other response finishes the request.
     pub fn send_request(
         &mut self,
         req: Request<B>,
@@ -161,13 +165,13 @@ where
         if connect && !body.is_end_stream() {
             return Err(usage(UsageError::WrongPhase));
         }
-        // CONNECT goes without FIN and without a pipe (Task 8 takes it from there).
+        // CONNECT goes without FIN and without a pipe: a tunnel, or a FIN on a non-2xx.
         let end = !connect && body.is_end_stream();
         let on_open = (!connect && !end).then(|| {
             let (sh, exec) = (self.shared.clone(), self.exec.clone());
             Box::new(move |id| spawn_body_pipe(sh, id, body, &exec, Owns::Send)) as OnOpen
         });
-        let req = (fields, end, on_open);
+        let req = ((fields, end, on_open), connect);
         if parts.extensions.get::<Protocol>().is_some() {
             return Ok(Err(req));
         }
@@ -191,11 +195,13 @@ where
     }
 }
 
-/// A request's HEADERS, whether they end the stream, and its body pipe.
-type Queued = (Fields, bool, Option<OnOpen>);
+/// A request's HEADERS, whether they end the stream, and its body pipe; whether it is a
+/// CONNECT.
+type Queued = ((Fields, bool, Option<OnOpen>), bool);
 
-/// Queue `req` for the driver to open its stream, unless new requests are refused.
-fn enqueue(shared: &Shared, req: Queued) -> Result<InFlight, Error> {
+/// Queue `req` for the driver to open its stream, unless new requests are refused. A
+/// CONNECT's `InFlight` reserves the tunnel: it settles the upgrade at the response.
+fn enqueue(shared: &Shared, (req, connect): Queued) -> Result<InFlight, Error> {
     let mut req = Some(req);
     // On refusal `req` (it may own the body) is dropped after the lock.
     let ticket = shared.with(|i| {
@@ -218,6 +224,7 @@ fn enqueue(shared: &Shared, req: Queued) -> Result<InFlight, Error> {
         ticket,
         id: None,
         over: false,
+        connect,
     })
 }
 
@@ -230,6 +237,8 @@ struct InFlight {
     id: Option<StreamId>,
     /// Resolved: nothing to cancel.
     over: bool,
+    /// A CONNECT: a 2xx response carries a `PendingUpgrade`.
+    connect: bool,
 }
 
 impl InFlight {
@@ -242,8 +251,18 @@ impl InFlight {
             Poll::Ready(r) => r,
         };
         self.over = true;
-        let id = self.id;
-        Poll::Ready(r.map(|resp| resp.map(|()| RecvBody::new(shared, id.expect("opened")))))
+        let (id, connect) = (self.id, self.connect);
+        Poll::Ready(r.map(|resp| {
+            let id = id.expect("opened");
+            // Counted by `connect_response`, like the `RecvBody`'s user (ours).
+            let claim = (connect && resp.status().is_success())
+                .then(|| PendingUpgrade(OnceSlot::new(Claim::new(shared.clone(), id))));
+            let mut resp = resp.map(|()| RecvBody::new(shared, id));
+            if let Some(c) = claim {
+                resp.extensions_mut().insert(c);
+            }
+            resp
+        }))
     }
 
     /// Also returns the removed queue entry, to be dropped outside the lock.
@@ -267,9 +286,13 @@ impl InFlight {
         }
         let id = self.id.expect("set above");
         let r = response(i, id, cx);
-        // Ok: our user passes to the `RecvBody`.
-        if let Poll::Ready(Err(_)) = r {
-            i.release_user(id);
+        match &r {
+            Poll::Ready(Err(_)) => i.release_user(id),
+            // Ok: our user passes to the `RecvBody`.
+            Poll::Ready(Ok(resp)) if self.connect => {
+                connect_response(i, id, resp.status().is_success())
+            }
+            _ => {}
         }
         (r, gone)
     }

@@ -17,7 +17,8 @@ use std::task::{Context, Poll};
 /// A received request or response body: DATA, then optional trailers.
 ///
 /// Dropping it before the end aborts the stream with `H3_REQUEST_CANCELLED` in both
-/// directions: the core has no receive-only abort.
+/// directions: the core has no receive-only abort. Once a tunnel owns the stream
+/// ([`upgrade`](crate::upgrade)) it is detached: an ended body whose drop does nothing.
 pub struct RecvBody {
     shared: Shared,
     id: StreamId,
@@ -117,30 +118,9 @@ impl Drop for RecvBody {
     fn drop(&mut self) {
         let id = self.id;
         self.shared.with(|i| {
-            let closed = i.close.is_some();
-            let Some(r) = i.streams.get_mut(&id).map(|s| &mut s.recv) else {
-                return;
-            };
-            if !r.detached {
-                r.waker = None;
-                r.consumer_waiting = false;
-                if r.eof || r.error.is_some() || closed {
-                    // Ended: nothing to abort, but no reader remains either, so what is
-                    // left (bytes, trailers) goes and the direction is consumed.
-                    r.trailers = None;
-                    i.discard_body(id);
-                    i.wake_driver();
-                } else if r.task_owned {
-                    // No reader remains: the queued bytes go (their budget with them);
-                    // the per-request task commits the abort when it ends.
-                    r.abandoned = true;
-                    i.discard_body(id);
-                    i.wake_driver();
-                } else {
-                    // Err: not a live request stream any more; nothing to abort.
-                    let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);
-                    i.wake_driver();
-                }
+            // A detached body is not the reader: its drop does nothing.
+            if i.streams.get(&id).is_some_and(|s| !s.recv.detached) {
+                i.drop_reader(id);
             }
             i.release_user(id);
         });

@@ -70,6 +70,27 @@ pub(crate) struct StreamState {
     pub task_failed: bool,
     /// Server: the request carries `expect: 100-continue`, not answered yet.
     pub expect_continue: bool,
+    /// The upgrade of a CONNECT (spec §4.5).
+    pub up: Up,
+}
+
+/// Where a CONNECT stream's upgrade stands (spec §4.5). The `Claim` holding it counts one
+/// of the entry's `users`.
+#[derive(Debug, Default)]
+pub(crate) enum Up {
+    /// No tunnel pending: not a CONNECT, the claim is not taken (server), or it is over.
+    #[default]
+    None,
+    /// Server: an `OnUpgrade` holds the claim and no final response went out yet. The
+    /// claim is the reader; its waker is `recv.waker`.
+    Claimed,
+    /// A 2xx went out (server) or came in (client): the tunnel can be taken.
+    Active,
+    /// The tunnel was taken.
+    Tunnel,
+    /// Server: the final response settled a claim without a tunnel; its `OnUpgrade`
+    /// resolves to this.
+    Failed(Error),
 }
 
 impl StreamState {
@@ -84,6 +105,7 @@ impl StreamState {
             final_sent: false,
             task_failed: false,
             expect_continue: false,
+            up: Up::None,
         }
     }
 
@@ -93,8 +115,9 @@ impl StreamState {
 
     /// The receive direction is terminal for `Owns::Both` (spec §4.6), when any of:
     /// - the reader consumed the end: FIN arrived, the queue is drained, the trailers taken;
-    /// - no reader remains: its `RecvBody` was dropped (`abandoned`; the queue was
-    ///   discarded and later body bytes are not queued);
+    /// - no reader remains: its `RecvBody` (or, after a claim, the claim or `TunnelRecv`)
+    ///   was dropped (`abandoned`; the queue was discarded and later body bytes are not
+    ///   queued), or dropped at EOF (the rest was discarded);
     /// - the stream was reset, errored or aborted.
     ///
     /// So a Service still reading the tail of a finished request is not cancelled (it may
@@ -130,6 +153,8 @@ pub(crate) struct SendState {
     pub done: bool,
     /// The transport acknowledged everything (`poll_stopped` returned `None`).
     pub acked: bool,
+    /// Why the send side ended, if not by our FIN: `SendStopped` or `StreamAborted`.
+    pub error: Option<Error>,
 }
 
 /// The receive side of a request stream (spec §3.2, §4.4).
@@ -147,8 +172,8 @@ pub(crate) struct RecvState {
     pub eof: bool,
     pub trailers: Option<HeaderMap>,
     pub error: Option<Error>,
-    /// Receive ownership moved to a tunnel (Task 8): the `RecvBody` is an ended body that
-    /// never aborts; queued bytes stay for the tunnel.
+    /// Receive ownership moved to an upgrade claim or tunnel: the `RecvBody` is an ended
+    /// body that never aborts and is not the reader; queued bytes stay for the tunnel.
     pub detached: bool,
     pub waker: Option<Waker>,
     /// A consumer found the queue empty and has not been handed a frame since.
@@ -343,10 +368,37 @@ impl Inner {
             st.send = SendState {
                 done: true,
                 acked: st.send.acked,
+                error: st.send.error.take(),
                 ..SendState::default()
             };
         }
         self.fire_cancels(id);
+    }
+
+    /// The reader of `id`'s receive side (a `RecvBody`, a claim or a `TunnelRecv`) is
+    /// gone before reading to the end. If the direction ended (FIN, error, close) what is
+    /// left goes and it counts as consumed. Otherwise the stream is aborted with
+    /// `H3_REQUEST_CANCELLED` in both directions (no receive-only abort), or, while a
+    /// per-request task owns it, the queue goes, `abandoned` is set and the task commits
+    /// the abort when it ends.
+    pub(crate) fn drop_reader(&mut self, id: StreamId) {
+        let closed = self.close.is_some();
+        let Some(r) = self.streams.get_mut(&id).map(|s| &mut s.recv) else {
+            return;
+        };
+        r.waker = None;
+        r.consumer_waiting = false;
+        if r.eof || r.error.is_some() || closed {
+            r.trailers = None;
+            self.discard_body(id);
+        } else if r.task_owned {
+            r.abandoned = true;
+            self.discard_body(id);
+        } else {
+            // Err: not a live request stream any more; nothing to abort.
+            let _ = self.conn.abort(id, H3Code::REQUEST_CANCELLED);
+        }
+        self.wake_driver();
     }
 
     /// Queue a body slice of `id`; `demand` counts it against the stream's reservation.
