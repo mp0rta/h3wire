@@ -5,5 +5,7 @@
 #[cfg(test)]
 pub mod exec;
 pub mod mock;
+pub mod peer;
 
 pub use mock::{Ack, MockConn, MockNet, MockObs, Side};
+pub use peer::{CorePeer, PeerObs};

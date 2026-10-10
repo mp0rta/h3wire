@@ -12,6 +12,9 @@
 #[path = "testing/mod.rs"]
 pub mod __testing;
 pub mod builder;
+// Driver, shared state and OnceSlot are wired up by the client and server (Tasks 6–9).
+#[allow(dead_code)]
+mod driver;
 pub mod error;
 pub mod ext;
 // Consumed by the client and server (later tasks).
@@ -19,6 +22,10 @@ pub mod ext;
 mod http_map;
 pub mod quic;
 pub mod rt;
+#[allow(dead_code)]
+mod slot;
+#[allow(dead_code)]
+mod state;
 #[cfg(test)]
 mod tests;
 
