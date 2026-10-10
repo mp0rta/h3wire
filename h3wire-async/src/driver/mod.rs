@@ -159,14 +159,19 @@ impl<C: quic::Connection> Driver<C> {
     /// Every request is over: none waits for its stream; on every stream with an entry
     /// the head was taken and the receive side ended; and every request send half is
     /// acknowledged or reset (checked on the halves: a reaped entry may still have one).
+    ///
+    /// Server: a stream the peer never sent anything on is a hole, not waited for (spec
+    /// §4.2); QUIC opens lower ids implicitly, so the transport still hands it out.
     fn drained(&self) -> bool {
-        !self.sends.keys().any(|id| id.is_request())
-            && self.shared.with(|i| {
-                i.opens.values().all(|o| o.done.is_some())
-                    && i.streams
-                        .values()
-                        .all(|st| st.head.is_none() && st.recv_terminal())
-            })
+        let server = self.role == Role::Server;
+        self.shared.with(|i| {
+            let hole = |id: &StreamId| server && i.streams.get(id).is_some_and(|st| !st.seen);
+            !self.sends.keys().any(|id| id.is_request() && !hole(id))
+                && i.opens.values().all(|o| o.done.is_some())
+                && i.streams
+                    .iter()
+                    .all(|(id, st)| hole(id) || (st.head.is_none() && st.recv_terminal()))
+        })
     }
 
     /// Close the connection with `code` and fail every handle (no-op once closed).

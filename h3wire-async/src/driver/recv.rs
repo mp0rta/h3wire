@@ -70,6 +70,11 @@ impl<C: quic::Connection> Driver<C> {
             return Ok(false);
         };
         *budget -= 1;
+        self.shared.with(|i| {
+            if let Some(st) = i.streams.get_mut(&id) {
+                st.seen = true;
+            }
+        });
         match res {
             Ok(Some(chunk)) => {
                 if let Some(off) = self.feed(id, &chunk, false, tier) {

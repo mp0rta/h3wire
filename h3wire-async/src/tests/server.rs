@@ -671,6 +671,28 @@ fn graceful_shutdown_holes_and_reordering() {
     assert_eq!(s.net.closed_with(Side::Server), Some(0x100));
 }
 
+/// A stream the peer opened (the transport hands it out, as quinn does for a lower id
+/// implied by a higher one) but never sent a byte on is not waited for (spec §4.2).
+#[test]
+fn graceful_shutdown_skips_unused_hole() {
+    let mut s = server(|_| -> Fut { Box::pin(async { respond(200, ChanBody::of(&[b"ok"])) }) });
+    s.net.ack_mode(Ack::Manual);
+    let get = req("GET", "/");
+    let (net, peer, conn) = (&s.net, &mut s.peer, &mut s.conn);
+    run(&s.exec, async {
+        assert_eq!(peer.open_bidi().await.unwrap(), S0); // never used
+        let b = open(peer, &get, true).await;
+        drive_until(peer, conn, |p| finished(p, b)).await;
+        Pin::new(&mut *conn).graceful_shutdown();
+        let goaway = PeerObs::Event(Event::GoAway { id: 8 });
+        drive_until(peer, conn, |p| p.trace().contains(&goaway)).await;
+        assert_eq!(net.closed_with(Side::Server), None, "not acknowledged yet");
+        net.ack_all();
+        drive(peer, conn).await.expect("a clean close");
+    });
+    assert_eq!(s.net.closed_with(Side::Server), Some(0x100));
+}
+
 /// A Service that holds its request body until `drop_tx` fires, drops it, then waits
 /// forever on something unrelated; `alive` gains a clone while its future lives.
 fn body_holder(

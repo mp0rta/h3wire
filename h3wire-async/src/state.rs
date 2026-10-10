@@ -75,6 +75,9 @@ pub(crate) struct StreamState {
     /// was still going out. The `H3_REQUEST_CANCELLED` abort waits for the send side to
     /// end, so a complete response is not reset (only reading stops, RFC 9114 §4.1).
     pub abort_after_send: bool,
+    /// The transport delivered something on the stream (bytes, FIN or a reset). Server: a
+    /// stream never seen is a hole graceful shutdown does not wait for (spec §4.2).
+    pub seen: bool,
     /// The upgrade of a CONNECT (spec §4.5).
     pub up: Up,
     /// HTTP datagrams (spec §3.4).
@@ -113,6 +116,7 @@ impl StreamState {
             task_failed: false,
             expect_continue: false,
             abort_after_send: false,
+            seen: false,
             up: Up::None,
             dgram: DgramState::default(),
         }
