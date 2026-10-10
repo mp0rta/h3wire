@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
 //! Connection builder: the core's `Config` plus async limits.
-// The fields are read by the driver, which lands in a later task.
-#![allow(dead_code)]
 
 use h3wire::{Config, UsageError};
 

@@ -30,7 +30,6 @@ impl Executor<BoxTask> for TokioExecutor {
 }
 
 /// Which directions of a stream an executor task owns (spec §4.6).
-#[allow(dead_code)] // the client and server spawn tasks (Tasks 6–7)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Owns {
     /// Server per-request task: cancelled once both directions are terminal.

@@ -18,20 +18,14 @@ pub mod body;
 pub mod builder;
 pub mod client;
 pub mod datagram;
-// Driver, shared state and OnceSlot are wired up by the client and server (Tasks 6–9).
-#[allow(dead_code)]
 mod driver;
 pub mod error;
 pub mod ext;
-// Consumed by the client and server (later tasks).
-#[allow(dead_code)]
 mod http_map;
 pub mod quic;
 pub mod rt;
 pub mod server;
-#[allow(dead_code)]
 mod slot;
-#[allow(dead_code)]
 mod state;
 #[cfg(test)]
 mod tests;

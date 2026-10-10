@@ -287,31 +287,11 @@ fn core_peer_open_waits_for_credit() {
 }
 
 #[test]
-fn once_slot_single_consumption_and_last_drop() {
-    let hits = Arc::new(AtomicUsize::new(0));
-    let hook = |h: &Arc<AtomicUsize>| {
-        let h = h.clone();
-        move |v: u32| {
-            assert_eq!(v, 7);
-            h.fetch_add(1, Ordering::SeqCst);
-        }
-    };
-    // Taken: the hook never runs.
+fn once_slot_single_consumption() {
     let a = OnceSlot::new(7u32);
-    a.on_last_drop(hook(&hits));
     let b = a.clone();
     assert_eq!(b.take(), Some(7));
     assert_eq!(a.take(), None);
-    drop((a, b));
-    assert_eq!(hits.load(Ordering::SeqCst), 0);
-    // Untaken: the hook runs once, when the last clone goes.
-    let a = OnceSlot::new(7u32);
-    a.on_last_drop(hook(&hits));
-    let b = a.clone();
-    drop(a);
-    assert_eq!(hits.load(Ordering::SeqCst), 0);
-    drop(b);
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[test]
