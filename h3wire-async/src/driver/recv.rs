@@ -10,6 +10,10 @@
 //! Whatever a read returns beyond what the core takes (end of discovery, `Recv::Paused`)
 //! is `retained` with FIN, and fed again only within a tier's budget. While a stream has
 //! retained bytes the transport is not read.
+//!
+//! Body reads (tiers 2 and 3) are also capped at the discovery read size, so a paused
+//! remainder never exceeds it. None of these bounds apply to the drain after a transport
+//! loss (`drain_after_loss`): what the dead transport still holds is already in memory.
 
 use super::{Driver, dispatch_events};
 use crate::client::decode_head;

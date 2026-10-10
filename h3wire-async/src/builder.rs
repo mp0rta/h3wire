@@ -76,7 +76,9 @@ impl Builder {
     ///
     /// The receive limits count each queued body chunk as its length, but at least 64
     /// bytes (its bookkeeping); chunks shorter than 4 KiB are copied out of the
-    /// transport's buffer, longer ones are kept zero-copy.
+    /// transport's buffer, longer ones are kept zero-copy. A single body read is also
+    /// capped at the header-discovery read size,
+    /// [`max_encoded_field_section_size`](Self::max_encoded_field_section_size) + 16.
     pub fn read_ahead(&mut self, n: usize) -> &mut Self {
         self.read_ahead = n;
         self
@@ -89,7 +91,9 @@ impl Builder {
     }
 
     /// Bytes read per demand reservation. Default 16 KiB; values below 64 count as 64
-    /// (see [`read_ahead`](Self::read_ahead) for how queued bytes are counted).
+    /// (see [`read_ahead`](Self::read_ahead) for how queued bytes are counted). A demand
+    /// read is also capped at the header-discovery read size,
+    /// [`max_encoded_field_section_size`](Self::max_encoded_field_section_size) + 16.
     pub fn demand_chunk(&mut self, n: usize) -> &mut Self {
         self.demand_chunk = n;
         self

@@ -182,6 +182,12 @@ pub trait RecvStream: Send + 'static {
     /// The stream id.
     fn id(&self) -> StreamId;
     /// Read the next in-order chunk of at most `max_len` bytes; `None` is EOF.
+    ///
+    /// After the connection failed (any operation returned a [`TransportError`]), the
+    /// driver drains each stream it still holds: it reads, with a no-op waker and no
+    /// size limit, until a read returns `Pending`, an error or EOF. A backend may still
+    /// return data it received before the loss (quinn does), but since the connection is
+    /// dead it receives nothing new, so the drain ends.
     fn poll_read_chunk(
         &mut self,
         cx: &mut Context<'_>,
