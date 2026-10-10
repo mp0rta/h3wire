@@ -225,6 +225,35 @@ fn unregistered_final_response_aborts_datagram_error() {
     unregistered_client();
 }
 
+/// A `register` after the final response went out unregistered returns the handle but
+/// does not lift the decision: a later datagram still aborts with `H3_DATAGRAM_ERROR`,
+/// and the handle's `recv` reports that abort.
+#[test]
+fn register_after_unregistered_response_still_aborts() {
+    let (net, _info, mut peer, mut reqs, exec) = server(&Builder::new(), true);
+    run(&exec, async {
+        let (s, (req, tx)) = open(&mut peer, &mut reqs, &POST).await;
+        tx.send(reply(200, "ok")).unwrap();
+        wait(&mut peer, |p| {
+            seen(p, s) && p.core().peer_settings().is_some()
+        })
+        .await;
+        let mut d = slot(&req)
+            .register()
+            .expect("the first call still gets the handle");
+        peer.send_datagram(s, b"x").unwrap();
+        wait(&mut peer, |_| dg_abort(&net, Side::Server, s)).await;
+        let e = drive(&mut peer, &mut pin!(d.recv()))
+            .await
+            .expect_err("aborted");
+        assert!(
+            matches!(e.kind(), ErrorKind::StreamAborted { code, .. } if *code == H3Code::DATAGRAM_ERROR),
+            "{e:?}"
+        );
+        drop(req);
+    });
+}
+
 #[test]
 fn registered_rejected_connect_drops_silently() {
     let (net, _info, mut peer, mut reqs, exec) = server(&Builder::new(), true);

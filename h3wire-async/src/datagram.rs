@@ -4,11 +4,12 @@
 //!
 //! - **Server:** while `H3_DATAGRAM` is advertised, every request carries a
 //!   [`DatagramSlot`]. [`DatagramSlot::register`] registers datagram semantics for the
-//!   request and returns its [`Datagrams`]. Datagrams that arrive before the decision are
-//!   kept (bounded, oldest evicted). If the final response is sent without registration,
-//!   any datagram already received, or arriving later, aborts the request with
-//!   `H3_DATAGRAM_ERROR`. Dropping every clone of the slot without registering does not
-//!   decide by itself.
+//!   request and returns its [`Datagrams`]; to receive datagrams, register **before** the
+//!   final response is sent. Datagrams that arrive before the decision are kept
+//!   (bounded, oldest evicted). If the final response is sent without registration, any
+//!   datagram already received, or arriving later, aborts the request with
+//!   `H3_DATAGRAM_ERROR`, even if `register` is called afterwards. Dropping every clone
+//!   of the slot without registering does not decide by itself.
 //! - **Client:** put [`RegisterDatagrams`] in a request's extensions to register at
 //!   send; its response, whatever the status, carries a [`DatagramSlot`] whose first
 //!   `register` returns the handle. A handle never taken discards the datagrams. Without
@@ -51,8 +52,11 @@ impl DatagramSlot {
     }
 
     /// Server: register datagram semantics and return the handle (the datagrams that
-    /// arrived so far come first). Client: return the handle (semantics were registered
-    /// at send). `None` after the first call.
+    /// arrived so far come first). Call it before the final response is sent: once a
+    /// final response went out unregistered, the first call still returns the handle but
+    /// registers nothing, so any datagram aborts the request with `H3_DATAGRAM_ERROR` and
+    /// the handle's [`recv`](Datagrams::recv) reports that abort. Client: return the
+    /// handle (semantics were registered at send). `None` after the first call.
     pub fn register(&self) -> Option<Datagrams> {
         let d = self.0.take()?;
         d.shared.with(|i| i.register_datagrams(d.id));

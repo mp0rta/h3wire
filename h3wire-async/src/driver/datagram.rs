@@ -122,13 +122,18 @@ pub(crate) fn push_bounded(q: &mut VecDeque<Bytes>, cap: usize, b: Bytes) {
 
 impl Inner {
     /// Register datagram semantics on `id` (a decision): pending datagrams move to the
-    /// handle's queue.
+    /// handle's queue. A stream already decided without registration stays so: its
+    /// datagrams keep aborting it.
     pub(crate) fn register_datagrams(&mut self, id: StreamId) {
-        let pending = self.dgram.take_pending(id);
         let cap = self.dgram.queue_cap;
         let Some(d) = self.streams.get_mut(&id).map(|s| &mut s.dgram) else {
             return;
         };
+        if d.decided && !d.registered {
+            return;
+        }
+        let pending = self.dgram.take_pending(id);
+        let d = &mut self.streams.get_mut(&id).expect("checked above").dgram;
         d.registered = true;
         d.decided = true;
         for b in pending {
