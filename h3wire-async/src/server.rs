@@ -294,7 +294,10 @@ impl Commit {
     /// 1. `H3_INTERNAL_ERROR` if it failed: no final response, or the body pipe failed;
     /// 2. else `H3_REQUEST_CANCELLED` if its `RecvBody` was dropped before the end.
     ///
-    /// A cancelled task's stream is already over in both directions: no-op there.
+    /// A cancelled task's response side is over, so its abort only acts on the request
+    /// side: a no-op once the request ended, else (its body was dropped before FIN, so no
+    /// reader remained) a STOP_SENDING with the code above, `H3_INTERNAL_ERROR` when no
+    /// final response was sent.
     fn commit(&self) {
         let id = self.id;
         self.shared.with(|i| {

@@ -125,6 +125,9 @@ impl Drop for RecvBody {
                 r.waker = None;
                 r.consumer_waiting = false;
                 if r.eof || r.error.is_some() || closed {
+                    // Ended: nothing to abort, but no reader remains either, so what is
+                    // left (bytes, trailers) goes and the direction is consumed.
+                    r.trailers = None;
                     i.discard_body(id);
                     i.wake_driver();
                 } else if r.task_owned {

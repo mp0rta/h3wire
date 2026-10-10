@@ -641,16 +641,18 @@ fn graceful_shutdown_holes_and_reordering() {
     assert_eq!(s.net.closed_with(Side::Server), Some(0x100));
 }
 
-/// No reader remains: a Service that dropped its unread body (with bytes queued) and then
-/// waits on something unrelated is cancelled once the response side ends too; the queued
-/// bytes are released at the drop and the entry is reaped.
-#[test]
-fn abandoned_body_then_unrelated_wait_is_cancelled() {
-    let alive = Arc::new(());
+/// A Service that holds its request body until `drop_tx` fires, drops it, then waits
+/// forever on something unrelated; `alive` gains a clone while its future lives.
+fn body_holder(
+    alive: &Arc<()>,
+) -> (
+    oneshot::Sender<()>,
+    impl FnMut(Request<RecvBody>) -> Fut + Clone + Send + 'static,
+) {
     let a2 = alive.clone();
     let (drop_tx, drop_rx) = oneshot::channel::<()>();
     let drop_rx = Arc::new(Mutex::new(Some(drop_rx)));
-    let mut s = server(move |req: Request<RecvBody>| -> Fut {
+    let f = move |req: Request<RecvBody>| -> Fut {
         let held = a2.clone();
         let rx = drop_rx.lock().unwrap().take().unwrap();
         Box::pin(async move {
@@ -660,7 +662,19 @@ fn abandoned_body_then_unrelated_wait_is_cancelled() {
             drop(body);
             std::future::pending().await
         })
-    });
+    };
+    (drop_tx, f)
+}
+
+/// No reader remains: a Service that dropped its unread body (with bytes queued) and then
+/// waits on something unrelated is cancelled once the response side ends too; the queued
+/// bytes are released at the drop, later body bytes are not queued, and the entry is
+/// reaped.
+#[test]
+fn abandoned_body_then_unrelated_wait_is_cancelled() {
+    let alive = Arc::new(());
+    let (drop_tx, f) = body_holder(&alive);
+    let mut s = server(f);
     let info = ConnInfo::new(s.shared.clone());
     let _srv = spawn(&s.exec, s.conn);
     run(&s.exec, async {
@@ -673,6 +687,10 @@ fn abandoned_body_then_unrelated_wait_is_cancelled() {
         s.peer
             .run_until(|_| info.__debug_recv_accounting() == (0, 0, 0))
             .await;
+        // Read, but nobody will consume it: dropped, not queued.
+        s.peer.send_body(a, b"more", false);
+        settle(&mut s.peer).await;
+        assert_eq!(info.__debug_recv_accounting(), (0, 0, 0));
         assert_eq!(Arc::strong_count(&alive), 3, "still running");
         s.peer.stop_sending(a, H3Code::REQUEST_CANCELLED);
         s.peer.send_body(a, b"def", true);
@@ -682,6 +700,34 @@ fn abandoned_body_then_unrelated_wait_is_cancelled() {
             .await;
     });
     assert_eq!(info.__debug_recv_accounting(), (0, 0, 0));
+}
+
+/// A body dropped after FIN with its trailers untaken also leaves no reader: the task is
+/// cancelled once the response side ends, the entry is reaped, and nothing is aborted
+/// with `H3_REQUEST_CANCELLED` (the request had ended).
+#[test]
+fn body_dropped_at_eof_with_trailers_then_unrelated_wait_is_cancelled() {
+    let alive = Arc::new(());
+    let (drop_tx, f) = body_holder(&alive);
+    let mut s = server(f);
+    let _srv = spawn(&s.exec, s.conn);
+    let eof = |sh: &Shared| sh.with(|i| i.streams.get(&S0).is_some_and(|st| st.recv.eof));
+    run(&s.exec, async {
+        let a = open(&mut s.peer, &req("POST", "/"), false).await;
+        s.peer.send_body(a, b"abc", false);
+        settle(&mut s.peer).await; // the DATA goes out before the trailers are queued
+        s.peer.send_headers(a, &[("x-t", "1")], true).unwrap();
+        s.peer.run_until(|_| eof(&s.shared)).await;
+        drop_tx.send(()).unwrap();
+        settle(&mut s.peer).await;
+        assert_eq!(Arc::strong_count(&alive), 3, "still running");
+        s.peer.stop_sending(a, H3Code::REQUEST_CANCELLED);
+        s.peer.run_until(|_| Arc::strong_count(&alive) == 2).await;
+        s.peer
+            .run_until(|_| s.shared.with(|i| i.streams.is_empty()))
+            .await;
+    });
+    assert!(!server_sent(&s.net, S0, H3Code::REQUEST_CANCELLED, true));
 }
 
 /// `poll_ready` fails: the connection closes with `H3_INTERNAL_ERROR`, and the output
