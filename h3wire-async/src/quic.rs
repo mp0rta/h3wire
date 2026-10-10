@@ -121,6 +121,10 @@ pub trait SendStream: Send + 'static {
     /// Write chunks, following quinn's semantics: the first `Written::chunks` entries are
     /// fully written, and the partially written chunk is advanced in place. Callers must
     /// not advance the buffers again. A pending operation is cancellation-safe.
+    ///
+    /// When `bufs` holds a non-empty chunk, `Ready(Ok(_))` means at least one byte was
+    /// accepted; with no room, return `Pending` and wake `cx` later. (The driver treats a
+    /// zero-byte `Ready` as blocked and waits for a wake.)
     fn poll_write_chunks(
         &mut self,
         cx: &mut Context<'_>,

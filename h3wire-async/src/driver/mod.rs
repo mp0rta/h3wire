@@ -6,8 +6,8 @@
 //! that returned `Ready`) is spent; then it wakes itself and yields. A round:
 //! 1. executes core actions and opens local uni streams;
 //! 2. accepts peer streams;
-//! 3. writes the core's sendable streams;
-//! 4. serves readiness tokens round-robin (reads, unblocked writes, `poll_stopped`);
+//! 3. writes the core's sendable streams (one write each);
+//! 4. serves readiness tokens round-robin (reads, writes, `poll_stopped`);
 //! 5. dispatches core events (also right after each `recv`, see `recv.rs`);
 //! 6. stops once the connection is closed.
 //!
@@ -22,6 +22,7 @@ use crate::error::{Error, ErrorKind};
 use crate::http_map::headers_from_block;
 use crate::quic::{self, RecvStream, SendStream, TransportError};
 use crate::state::{CloseCause, Dir, Inner, Shared, StreamState};
+use bytes::Bytes;
 use h3wire::{Action, Event, H3Code, HeadersKind, Role, StreamId, UniKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -38,6 +39,10 @@ pub(crate) struct Driver<C: quic::Connection> {
     recvs: HashMap<StreamId, C::Recv>,
     /// `Action::OpenUni` kinds waiting for `poll_open_uni`.
     open_uni: VecDeque<UniKind>,
+    /// The rest of each DATA frame in flight: `[prefix, payload]`, written ones removed.
+    frames: HashMap<StreamId, Vec<Bytes>>,
+    /// Streams whose `FinishStream` was executed (kept for acknowledgement polling).
+    finished: HashSet<StreamId>,
     /// Streams whose last write pended: skipped until their `Send` token fires.
     write_blocked: HashSet<StreamId>,
     work_budget: usize,
@@ -56,13 +61,17 @@ impl<C: quic::Connection> Driver<C> {
     pub(crate) fn new(conn: C, role: Role, b: &Builder) -> Self {
         let config = b.core_config(conn.max_datagram_size().is_some());
         let discovery_len = config.max_encoded_field_section_size.saturating_add(16);
+        let shared = Shared::new(h3wire::Connection::new(role, config));
+        shared.with(|i| i.send_capacity = b.send_capacity);
         Driver {
             conn,
-            shared: Shared::new(h3wire::Connection::new(role, config)),
+            shared,
             role,
             sends: HashMap::new(),
             recvs: HashMap::new(),
             open_uni: VecDeque::new(),
+            frames: HashMap::new(),
+            finished: HashSet::new(),
             write_blocked: HashSet::new(),
             work_budget: b.work_budget.max(1),
             discovery_len,
@@ -137,10 +146,11 @@ impl<C: quic::Connection> Driver<C> {
             match a {
                 Action::OpenUni(kind) => self.open_uni.push_back(kind),
                 Action::ResetStream { stream, code } => {
-                    if let Some(mut s) = self.sends.remove(&stream) {
+                    if let Some(s) = self.sends.get_mut(&stream) {
                         s.reset(code.0);
                     }
-                    self.write_blocked.remove(&stream);
+                    self.drop_send(stream);
+                    self.shared.with(|i| i.send_terminal(stream));
                 }
                 Action::StopSending { stream, code } => {
                     if let Some(mut r) = self.recvs.remove(&stream) {
@@ -148,10 +158,12 @@ impl<C: quic::Connection> Driver<C> {
                     }
                     self.shared.with(|i| i.retained.remove(&stream));
                 }
-                Action::FinishStream(s) => {
-                    if let Some(s) = self.sends.get_mut(&s) {
+                Action::FinishStream(id) => {
+                    if let Some(s) = self.sends.get_mut(&id) {
                         s.finish();
+                        self.finished.insert(id);
                     }
+                    self.shared.with(|i| i.send_terminal(id));
                 }
                 Action::CloseConnection { code, .. } => {
                     self.conn.close(code.0);
@@ -297,13 +309,20 @@ fn dispatch_events(i: &mut Inner) {
                     st.recv.eof = true;
                     i.pending_wakers.extend(st.recv.waker.take());
                 }
+                i.fire_cancels(stream);
             }
             Event::StreamAborted {
                 stream,
                 code,
                 source,
             } => {
+                let waiters = i.cap_waiters.len();
                 i.discard_body(stream);
+                if i.cap_waiters.len() < waiters {
+                    // Budget freed outside any read: the driver must not rely on this
+                    // round having moved.
+                    i.wake_driver();
+                }
                 if let Some(st) = i.streams.get_mut(&stream) {
                     st.recv.trailers = None;
                     st.recv.error = Some(
@@ -316,8 +335,11 @@ fn dispatch_events(i: &mut Inner) {
                     );
                     i.pending_wakers.extend(st.recv.waker.take());
                 }
+                // A whole-stream abort ends the send side too.
+                i.send_terminal(stream);
             }
-            // GOAWAY, SendStopped and uni stream types are dispatched by Tasks 5–9;
+            Event::SendStopped { stream, .. } => i.send_terminal(stream),
+            // GOAWAY and uni stream types are dispatched by Tasks 6–9;
             // `Closed` is handled where the cause is known.
             _ => {}
         }

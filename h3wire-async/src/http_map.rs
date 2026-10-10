@@ -11,6 +11,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version}
 use crate::ext::Protocol;
 
 /// Owned encoded fields: one buffer plus `(name, value, never_index)` ranges.
+#[derive(Debug)]
 pub(crate) struct Fields {
     buf: Vec<u8>,
     entries: Vec<(Range<usize>, Range<usize>, bool)>,

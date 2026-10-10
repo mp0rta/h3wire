@@ -6,7 +6,9 @@
 //! Wakers collected under the lock (`pending_wakers`) are woken after it is released.
 
 use crate::error::{Error, ErrorKind};
+use crate::http_map::Fields;
 use crate::quic::TransportError;
+use crate::rt::{CancelToken, Owns};
 use bytes::Bytes;
 use h3wire::{Connection, H3Code, HeaderBlockId, StreamId};
 use http::HeaderMap;
@@ -46,8 +48,6 @@ impl CloseCause {
 }
 
 /// Per-stream protocol state. The QUIC objects live in the driver.
-///
-/// Task 5 adds `send` (queue, admission, waker) and the cancel tokens.
 #[derive(Debug)]
 pub(crate) struct StreamState {
     /// Header discovery is running: the request (server) or final response (client)
@@ -57,6 +57,9 @@ pub(crate) struct StreamState {
     /// releases it must `mark_ready(id, Dir::Recv)`: a stream paused on it feeds again.
     pub head: Option<HeaderBlockId>,
     pub recv: RecvState,
+    pub send: SendState,
+    /// Executor tasks owning directions of this stream (spec §4.6).
+    pub cancels: Vec<(Owns, CancelToken)>,
 }
 
 impl StreamState {
@@ -65,8 +68,40 @@ impl StreamState {
             discovering: true,
             head: None,
             recv: RecvState::default(),
+            send: SendState::default(),
+            cancels: Vec::new(),
         }
     }
+
+    fn recv_terminal(&self) -> bool {
+        self.recv.eof || self.recv.error.is_some()
+    }
+}
+
+/// How the user side of a send ended.
+#[derive(Debug)]
+pub(crate) enum End {
+    /// FIN only.
+    Fin,
+    /// Trailers, sent as HEADERS with `fin = true`.
+    Trailers(Fields),
+}
+
+/// The send side of a request stream (spec §3.3).
+#[derive(Debug, Default)]
+pub(crate) struct SendState {
+    /// Admitted payloads, oldest first. The head stays queued until its DATA frame is
+    /// fully written.
+    pub queue: VecDeque<Bytes>,
+    pub queued: usize,
+    /// Set by the producer once it ended; taken by the driver when the queue is empty.
+    pub end: Option<End>,
+    /// The producer, waiting for admission.
+    pub waker: Option<Waker>,
+    /// Finished, stopped, reset or aborted: the producer stops.
+    pub done: bool,
+    /// The transport acknowledged everything (`poll_stopped` returned `None`).
+    pub acked: bool,
 }
 
 /// The receive side of a request stream (spec §3.2, §4.4).
@@ -114,6 +149,8 @@ pub(crate) struct Inner {
     pub speculative: usize,
     /// Streams with read-ahead room that the connection cap holds back.
     pub cap_waiters: HashSet<StreamId>,
+    /// Per-stream send-queue capacity `S`.
+    pub send_capacity: usize,
 }
 
 impl Inner {
@@ -158,7 +195,64 @@ impl Inner {
         self.wake_conn();
         for st in self.streams.values_mut() {
             self.pending_wakers.extend(st.recv.waker.take());
+            self.pending_wakers.extend(st.send.waker.take());
+            for (_, t) in st.cancels.drain(..) {
+                self.pending_wakers.extend(t.fire());
+            }
         }
+    }
+
+    /// A producer may queue on `id` (spec §3.3): fewer than `S` bytes queued.
+    pub(crate) fn admit(&self, id: StreamId) -> bool {
+        self.streams
+            .get(&id)
+            .is_some_and(|st| st.send.queued < self.send_capacity)
+    }
+
+    /// A token for a task owning `owns` of `id`. It fires at once if those directions
+    /// are already terminal, the stream is gone or the connection is closed.
+    pub(crate) fn cancel_token(&mut self, id: StreamId, owns: Owns) -> CancelToken {
+        let t = CancelToken::default();
+        match self.streams.get_mut(&id) {
+            Some(st) if self.close.is_none() => st.cancels.push((owns, t.clone())),
+            _ => {
+                t.fire();
+            }
+        }
+        self.fire_cancels(id);
+        t
+    }
+
+    /// Fire the tokens of `id` whose directions are now terminal.
+    pub(crate) fn fire_cancels(&mut self, id: StreamId) {
+        let Some(st) = self.streams.get_mut(&id) else {
+            return;
+        };
+        let (send, both) = (st.send.done, st.send.done && st.recv_terminal());
+        st.cancels.retain(|(owns, t)| {
+            let fire = match owns {
+                Owns::Both => both,
+                Owns::Send => send,
+            };
+            if fire {
+                self.pending_wakers.extend(t.fire());
+            }
+            !fire
+        });
+    }
+
+    /// The send side of `id` is over (finished, stopped, reset or aborted): drop what is
+    /// queued, release the producer, fire the tokens.
+    pub(crate) fn send_terminal(&mut self, id: StreamId) {
+        if let Some(st) = self.streams.get_mut(&id) {
+            self.pending_wakers.extend(st.send.waker.take());
+            st.send = SendState {
+                done: true,
+                acked: st.send.acked,
+                ..SendState::default()
+            };
+        }
+        self.fire_cancels(id);
     }
 
     /// Queue a body slice of `id`; `demand` counts it against the stream's reservation.
@@ -254,6 +348,7 @@ impl Shared {
             retained: HashMap::new(),
             speculative: 0,
             cap_waiters: HashSet::new(),
+            send_capacity: 64 * 1024,
         })))
     }
 

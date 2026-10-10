@@ -10,7 +10,7 @@ use h3wire::{
     Action, Config, Connection, Datagram, Event, FieldRef, H3Code, HeaderBlockId, Recv, Role,
     StreamId, UniKind, UsageError,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
 use std::task::{Context, Poll};
 
@@ -62,6 +62,8 @@ pub struct CorePeer<C: Quic> {
     role: Role,
     sends: HashMap<StreamId, C::Send>,
     recvs: HashMap<StreamId, C::Recv>,
+    /// Send halves the peer stopped: reported to the core once, never written again.
+    stopped: HashSet<StreamId>,
     /// Received bytes the core has not consumed (it paused), with FIN.
     inbox: HashMap<StreamId, (Vec<u8>, bool)>,
     out: HashMap<StreamId, Out>,
@@ -95,6 +97,7 @@ impl<C: Quic> CorePeer<C> {
             role,
             sends: HashMap::new(),
             recvs: HashMap::new(),
+            stopped: HashSet::new(),
             inbox: HashMap::new(),
             out: HashMap::new(),
             skim: HashMap::new(),
@@ -346,6 +349,9 @@ impl<C: Quic> CorePeer<C> {
         s: StreamId,
         bufs: &mut Vec<Bytes>,
     ) -> Option<usize> {
+        if self.stopped.contains(&s) {
+            return None;
+        }
         let w = self.sends.get_mut(&s)?;
         match w.poll_write_chunks(cx, bufs) {
             Poll::Pending => None,
@@ -354,6 +360,7 @@ impl<C: Quic> CorePeer<C> {
                 Some(n.bytes)
             }
             Poll::Ready(Err(WriteError::Stopped(code))) => {
+                self.stopped.insert(s);
                 let _ = self.core.stop_sending_received(s, H3Code(code));
                 None
             }

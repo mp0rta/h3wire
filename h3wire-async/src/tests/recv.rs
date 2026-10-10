@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::task::Poll;
 
 const D: usize = 16_384;
-const REQ: [(&str, &str); 4] = [
+pub(super) const REQ: [(&str, &str); 4] = [
     (":method", "POST"),
     (":scheme", "https"),
     (":authority", "a"),
@@ -50,7 +50,7 @@ fn data_frame(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn yield_now() {
+pub(super) async fn yield_now() {
     let mut yielded = false;
     poll_fn(|cx| {
         if yielded {
@@ -64,7 +64,7 @@ async fn yield_now() {
 }
 
 /// Step the peer and give the driver task a bounded number of turns.
-async fn settle(peer: &mut CorePeer<MockConn>) {
+pub(super) async fn settle(peer: &mut CorePeer<MockConn>) {
     for _ in 0..64 {
         poll_fn(|cx| {
             while peer.poll_step(cx).is_ready() {}
