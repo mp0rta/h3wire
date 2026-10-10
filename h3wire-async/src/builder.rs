@@ -97,13 +97,14 @@ impl Builder {
         self
     }
 
-    /// Per-stream send-queue capacity. Default 64 KiB.
+    /// Per-stream send-queue capacity: a producer is admitted while fewer bytes are
+    /// queued, and its chunk is taken whole. Default 64 KiB; 0 counts as 1.
     pub fn send_capacity(&mut self, n: usize) -> &mut Self {
         self.send_capacity = n;
         self
     }
 
-    /// Operations per driver pass before it yields. Default 64.
+    /// Operations per driver pass before it yields. Default 64; 0 counts as 1.
     pub fn work_budget(&mut self, n: usize) -> &mut Self {
         self.work_budget = n;
         self

@@ -785,3 +785,20 @@ fn request_body_error_is_body_kind() {
     request_body_error(false);
     request_body_error(true);
 }
+
+/// `send_capacity(0)` counts as 1: a body is still admitted and sent.
+#[test]
+fn zero_send_capacity_still_sends() {
+    let mut b = Builder::new();
+    b.send_capacity(0);
+    let (_net, mut send, conn, mut peer, exec) = client::<String>(&b, Config::default());
+    let _drv = spawn(&exec, conn);
+    run(&exec, async {
+        let _r = send.send_request(req(Method::POST, "https://a/", "abc".into()));
+        for _ in 0..8 {
+            settle(&mut peer).await;
+        }
+        assert_eq!(peer.body(S0), b"abc");
+        assert!(finished(&peer, S0));
+    });
+}

@@ -72,7 +72,7 @@ impl<C: quic::Connection> Driver<C> {
         let on = config.h3_datagram;
         let shared = Shared::new(h3wire::Connection::new(role, config));
         shared.with(|i| {
-            i.send_capacity = b.send_capacity;
+            i.send_capacity = b.send_capacity.max(1);
             i.dgram = datagram::Dgrams::new(b, on);
         });
         Driver {
