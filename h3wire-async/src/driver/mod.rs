@@ -283,12 +283,15 @@ impl<C: quic::Connection> Driver<C> {
             let Poll::Ready(r) = self.conn.poll_accept_bidi(cx) else {
                 break;
             };
-            let (s, r) = r?;
+            let (mut s, mut r) = r?;
             *budget -= 1;
             moved = true;
             let id = r.id();
             if self.role == Role::Client {
-                // RFC 9114 §6.1: the core closes with H3_STREAM_CREATION_ERROR.
+                // RFC 9114 §6.1: the core closes with H3_STREAM_CREATION_ERROR. The halves
+                // are refused with it first: a transport may FIN a half dropped as is.
+                s.reset(H3Code::STREAM_CREATION_ERROR.0);
+                r.stop(H3Code::STREAM_CREATION_ERROR.0);
                 let _ = self.shared.with(|i| i.conn.recv(id, &[], false));
                 continue;
             }

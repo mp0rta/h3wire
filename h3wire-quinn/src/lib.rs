@@ -6,10 +6,15 @@
 //! [`server`] and [`client`] wrap [`Builder`]. This crate selects no runtime, TLS
 //! provider or certificate verifier: the application configures its own quinn.
 //!
-//! Stream halves wrap quinn's. The driver always ends a half explicitly (finish, reset
-//! or stop) before dropping it, so quinn's implicit drop behaviour never adds a signal:
+//! Stream halves wrap quinn's. The driver ends every half explicitly (finish, reset or
+//! stop) before dropping it, including the halves of a bidirectional stream a server
+//! opens towards a client (refused with `H3_STREAM_CREATION_ERROR`). quinn's implicit
+//! drop behaviour then adds no signal, with one exception:
 //! - a dropped `quinn::SendStream` finishes the stream, which quinn ignores once it was
-//!   finished or reset, and does nothing once the connection has failed;
+//!   finished or reset, and does nothing once the connection has failed. A finished half
+//!   that the peer then stopped (STOP_SENDING before all of it was acknowledged) is
+//!   reset on drop, with the peer's code: RFC 9000 §3.5 permits that RESET_STREAM in
+//!   the "Data Sent" state;
 //! - a dropped `quinn::RecvStream` sends `STOP_SENDING(0)` only if it was neither read
 //!   to the end, reset by the peer, nor stopped.
 //!

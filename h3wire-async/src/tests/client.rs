@@ -469,9 +469,10 @@ fn dropped_response_future_cancels_request() {
 fn peer_bidi_stream_is_connection_error() {
     let (net, _send, conn, mut peer, exec) = client::<String>(&Builder::new(), Config::default());
     let drv = spawn(&exec, conn);
-    run(&exec, async {
-        peer.open_bidi().await.unwrap();
+    let s = run(&exec, async {
+        let s = peer.open_bidi().await.unwrap();
         peer.run_until(|_| done(&drv)).await;
+        s
     });
     let k = take(&drv).unwrap_err().kind().clone();
     assert!(
@@ -485,6 +486,27 @@ fn peer_bidi_stream_is_connection_error() {
         "{k:?}"
     );
     assert_eq!(net.closed_with(Side::Client), Some(0x103));
+    // Both halves are refused explicitly, never finished.
+    let code = H3Code::STREAM_CREATION_ERROR.0;
+    let side = Side::Client;
+    let t = net.trace();
+    assert!(
+        t.contains(&MockObs::Reset {
+            side,
+            stream: s,
+            code
+        }),
+        "{t:?}"
+    );
+    assert!(
+        t.contains(&MockObs::Stop {
+            side,
+            stream: s,
+            code
+        }),
+        "{t:?}"
+    );
+    assert!(!t.contains(&MockObs::Fin { side, stream: s }), "{t:?}");
 }
 
 /// Live handles of every kind when `fail` strikes: the driver, a live `RecvBody`, a
