@@ -3,7 +3,7 @@
 //! Message bodies: [`RecvBody`], the receive half, and the body pipe that feeds an
 //! outgoing body into a stream's send queue.
 
-use crate::error::{BoxError, Error};
+use crate::error::{BoxError, Error, ErrorKind};
 use crate::http_map::trailer_fields;
 use crate::rt::{BoxTask, Cancelable, Executor, Owns};
 use crate::state::{Dir, End, Inner, Shared, assert_unlocked};
@@ -12,6 +12,7 @@ use h3wire::{FieldRef, H3Code, StreamId};
 use http_body::{Body, Frame};
 use std::future::poll_fn;
 use std::pin::{Pin, pin};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// A received request or response body: DATA, then optional trailers.
@@ -206,7 +207,8 @@ fn end(shared: &Shared, id: StreamId, e: End) {
 }
 
 /// Spawn the client request-body pipe for `id`, wrapped in [`Cancelable`]. A body error
-/// aborts the stream with `H3_INTERNAL_ERROR` (spec §4.4).
+/// aborts the stream with `H3_INTERNAL_ERROR` (spec §4.4), and the response side sees
+/// it as [`ErrorKind::Body`] (spec §4.7).
 pub(crate) fn spawn_body_pipe<B, E>(shared: Shared, id: StreamId, body: B, exec: &E, owns: Owns)
 where
     B: Body + Send + 'static,
@@ -216,11 +218,21 @@ where
 {
     let token = shared.with(|i| i.cancel_token(id, owns));
     let task = async move {
-        if pipe_body(&shared, id, body).await.is_err() {
-            shared.with(|i| {
-                i.abort_local(id, H3Code::INTERNAL_ERROR);
-            });
+        if let Err(cause) = pipe_body(&shared, id, body).await {
+            shared.with(|i| body_failed(i, id, cause));
         }
     };
     exec.execute(Box::pin(Cancelable::new(Box::pin(task), token)));
+}
+
+/// The request body of `id` failed with `cause`: abort the stream with
+/// `H3_INTERNAL_ERROR`. Its reader (the `send_request` future, then the response's
+/// `RecvBody`) gets `ErrorKind::Body(cause)` in place of that local abort.
+fn body_failed(i: &mut Inner, id: StreamId, cause: BoxError) {
+    let live = i.streams.get(&id).is_some_and(|s| !s.recv_terminal());
+    i.abort_local(id, H3Code::INTERNAL_ERROR);
+    let recv = i.streams.get_mut(&id).map(|s| &mut s.recv);
+    if let Some(r) = recv.filter(|r| live && r.error.is_some()) {
+        r.error = Some(ErrorKind::Body(Arc::new(cause)).into());
+    }
 }

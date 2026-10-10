@@ -1621,6 +1621,7 @@ fn peer_received(w: &World, p: &CorePeer<MockConn>) -> Result<(), String> {
 /// - `StreamAborted` from the peer: the peer's RESET_STREAM on that stream;
 /// - `StreamAborted` of our own (or a GOAWAY cutoff): our STOP_SENDING on it, or our
 ///   CONNECTION_CLOSE (a graceful close may go out before a queued STOP_SENDING);
+/// - `Body` (our request body failed, so we aborted): as our own `StreamAborted`;
 /// - `Closed` / `Transport`: a CONNECTION_CLOSE, or both transports killed.
 ///
 /// So a peer STOP_SENDING, which only stops our sending, never ends receiving.
@@ -1635,8 +1636,14 @@ fn excuses(w: &World, mock: &[MockObs]) -> Result<(), String> {
                 let ok = match (e.kind(), r.sid) {
                     // The peer's RESET_STREAM ends our receiving; our own abort ends it
                     // with our STOP_SENDING (or our close).
-                    (ErrorKind::StreamAborted { source, .. }, Some(sid)) => {
-                        let peer = *source == AbortSource::Peer;
+                    (ErrorKind::StreamAborted { .. } | ErrorKind::Body(_), Some(sid)) => {
+                        let peer = matches!(
+                            e.kind(),
+                            ErrorKind::StreamAborted {
+                                source: AbortSource::Peer,
+                                ..
+                            }
+                        );
                         before(first(&|o| match *o {
                             MockObs::Reset { side, stream, .. } => {
                                 peer && side == other(s) && stream == sid

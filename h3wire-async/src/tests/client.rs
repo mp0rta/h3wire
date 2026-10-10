@@ -12,9 +12,11 @@ use crate::datagram::{DatagramSlot, RegisterDatagrams};
 use crate::error::{BoxError, DatagramError, Error, ErrorKind};
 use crate::ext::Protocol;
 use crate::upgrade;
+use bytes::Bytes;
+use futures::StreamExt;
 use h3wire::{AbortSource, Config, H3Code, Role, StreamId, UsageError};
 use http::{Method, Request, Response};
-use http_body::Body;
+use http_body::{Body, Frame};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::Poll;
@@ -707,4 +709,79 @@ fn dropping_every_sender_waits_in_flight() {
     });
     take(&drv).expect("a clean close");
     assert_eq!(net.closed_with(Side::Client), Some(0x100));
+}
+
+/// A request body fed through a channel.
+struct ChanBody(futures::channel::mpsc::UnboundedReceiver<Result<Frame<Bytes>, BoxError>>);
+
+impl Body for ChanBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        self.0.poll_next_unpin(cx)
+    }
+}
+
+#[derive(Debug)]
+struct Boom;
+
+impl std::fmt::Display for Boom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("boom")
+    }
+}
+
+impl std::error::Error for Boom {}
+
+/// A failing request body reaches the application as `ErrorKind::Body`, whose source is
+/// the body's own error: through `send_request` before the response, through the
+/// response's `RecvBody` after it. The peer sees `H3_INTERNAL_ERROR`.
+fn request_body_error(after_response: bool) {
+    let (net, mut send, conn, mut peer, exec) =
+        client::<ChanBody>(&Builder::new(), Config::default());
+    let _drv = spawn(&exec, conn);
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    tx.unbounded_send(Ok(Frame::data(Bytes::from_static(b"abc"))))
+        .unwrap();
+    let e = run(&exec, async {
+        let post = req(Method::POST, "https://a/", ChanBody(rx));
+        let r = spawn(&exec, send.send_request(post));
+        peer.run_until(|p| p.body(S0) == b"abc").await;
+        let mut body = None;
+        if after_response {
+            peer.send_headers(S0, &[(":status", "200")], false).unwrap();
+            peer.run_until(|_| done(&r)).await;
+            body = Some(take(&r).unwrap().into_body());
+        }
+        tx.unbounded_send(Err(Box::new(Boom))).unwrap();
+        match body {
+            Some(mut b) => next_frame(&mut peer, &mut b)
+                .await
+                .expect("an error")
+                .unwrap_err(),
+            None => {
+                peer.run_until(|_| done(&r)).await;
+                take(&r).unwrap_err()
+            }
+        }
+    });
+    assert!(matches!(e.kind(), ErrorKind::Body(_)), "{e:?}");
+    let src = std::error::Error::source(&e).expect("a source");
+    assert!(src.downcast_ref::<Boom>().is_some(), "{src:?}");
+    let reset = MockObs::Reset {
+        side: Side::Client,
+        stream: S0,
+        code: H3Code::INTERNAL_ERROR.0,
+    };
+    assert!(net.trace().contains(&reset), "{:?}", net.trace());
+}
+
+#[test]
+fn request_body_error_is_body_kind() {
+    request_body_error(false);
+    request_body_error(true);
 }
