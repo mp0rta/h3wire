@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.7
+# Interop peers at the versions pinned in versions.env (run.sh passes them as build args):
+# curl (ngtcp2/nghttp3), the ngtcp2 example client and server, quiche-client and
+# quiche-server, and h3spec. The build context is unused.
+ARG DEBIAN_IMAGE=debian:trixie-slim
+ARG RUST_IMAGE=rust:1.98-slim-trixie
+
+FROM ${DEBIAN_IMAGE} AS c-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ca-certificates pkg-config libssl-dev libev-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+# Clone a tag (with submodules) and check it is the pinned commit.
+RUN printf '%s\n' '#!/bin/sh' 'set -e' \
+        'git clone -q --depth 1 --branch "$2" --recurse-submodules --shallow-submodules "$1" "$4"' \
+        'test "$(git -C "$4" rev-parse HEAD)" = "$3" || { echo "$1 $2 is not $3" >&2; exit 1; }' \
+        > /usr/local/bin/fetch && chmod +x /usr/local/bin/fetch
+ARG NGHTTP3_TAG NGHTTP3_COMMIT NGTCP2_TAG NGTCP2_COMMIT CURL_TAG CURL_COMMIT
+RUN fetch https://github.com/ngtcp2/nghttp3 "$NGHTTP3_TAG" "$NGHTTP3_COMMIT" nghttp3 \
+    && cmake -S nghttp3 -B nghttp3/b -DCMAKE_BUILD_TYPE=Release -DENABLE_LIB_ONLY=ON \
+        -DENABLE_STATIC_LIB=OFF -DBUILD_TESTING=OFF \
+    && cmake --build nghttp3/b -j"$(nproc)" && cmake --install nghttp3/b
+RUN fetch https://github.com/ngtcp2/ngtcp2 "$NGTCP2_TAG" "$NGTCP2_COMMIT" ngtcp2 \
+    && cmake -S ngtcp2 -B ngtcp2/b -DCMAKE_BUILD_TYPE=Release -DENABLE_OPENSSL=ON \
+        -DENABLE_STATIC_LIB=OFF -DBUILD_TESTING=OFF \
+    && cmake --build ngtcp2/b -j"$(nproc)" && cmake --install ngtcp2/b \
+    && install -m 755 ngtcp2/b/examples/osslclient /usr/local/bin/ngtcp2-client \
+    && install -m 755 ngtcp2/b/examples/osslserver /usr/local/bin/ngtcp2-server
+RUN fetch https://github.com/curl/curl "$CURL_TAG" "$CURL_COMMIT" curl \
+    && cmake -S curl -B curl/b -DCMAKE_BUILD_TYPE=Release -DUSE_NGTCP2=ON -DCURL_USE_OPENSSL=ON \
+        -DUSE_NGHTTP2=OFF -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DUSE_LIBIDN2=OFF \
+        -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DCURL_DISABLE_LDAP=ON -DBUILD_TESTING=OFF \
+        -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF -DENABLE_CURL_MANUAL=OFF \
+    && cmake --build curl/b -j"$(nproc)" && cmake --install curl/b
+
+FROM ${RUST_IMAGE} AS quiche-build
+RUN apt-get update && apt-get install -y --no-install-recommends git clang cmake make \
+    && rm -rf /var/lib/apt/lists/*
+# boring-sys builds BoringSSL with cmake and passes clang-style flags.
+ENV CC=clang CXX=clang++
+WORKDIR /build
+ARG QUICHE_TAG QUICHE_COMMIT
+RUN git clone -q --depth 1 --branch "$QUICHE_TAG" --recurse-submodules --shallow-submodules \
+        https://github.com/cloudflare/quiche \
+    && test "$(git -C quiche rev-parse HEAD)" = "$QUICHE_COMMIT" \
+    && cargo build -q --release --manifest-path quiche/apps/Cargo.toml \
+    && install -s -m 755 quiche/target/release/quiche-client quiche/target/release/quiche-server \
+        /usr/local/bin/ \
+    && rm -rf quiche "$CARGO_HOME/registry" "$CARGO_HOME/git"
+
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates openssl libev4t64 zlib1g libgmp10 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=c-build /usr/local/lib/ /usr/local/lib/
+COPY --from=c-build /usr/local/bin/ /usr/local/bin/
+COPY --from=quiche-build /usr/local/bin/quiche-client /usr/local/bin/quiche-server /usr/local/bin/
+ARG H3SPEC_URL H3SPEC_SHA256
+ADD --checksum=sha256:${H3SPEC_SHA256} --chmod=755 ${H3SPEC_URL} /usr/local/bin/h3spec
+RUN ldconfig && curl --version | head -1 && h3spec -v
