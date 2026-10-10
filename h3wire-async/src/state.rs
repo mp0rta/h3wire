@@ -131,7 +131,8 @@ impl StreamState {
     /// - the reader consumed the end: FIN arrived, the queue is drained, the trailers taken;
     /// - no reader remains: its `RecvBody` (or, after a claim, the claim or `TunnelRecv`)
     ///   was dropped (`abandoned`; the queue was discarded and later body bytes are not
-    ///   queued), or dropped at EOF (the rest was discarded);
+    ///   queued), or dropped at EOF (the rest was discarded), or a claim settled without
+    ///   a tunnel was dropped (`drain`: read on and discarded);
     /// - the stream was reset, errored or aborted.
     ///
     /// So a Service still reading the tail of a finished request is not cancelled (it may
@@ -139,7 +140,10 @@ impl StreamState {
     /// and waits on something unrelated is.
     fn recv_consumed(&self) -> bool {
         let r = &self.recv;
-        r.error.is_some() || r.abandoned || (r.eof && r.queue.is_empty() && r.trailers.is_none())
+        r.error.is_some()
+            || r.abandoned
+            || r.drain
+            || (r.eof && r.queue.is_empty() && r.trailers.is_none())
     }
 }
 
@@ -196,6 +200,9 @@ pub(crate) struct RecvState {
     /// and sets `abandoned`; the task commits the abort when it ends.
     pub task_owned: bool,
     pub abandoned: bool,
+    /// The reader is gone without an abort (a claim settled without a tunnel): body bytes
+    /// are dropped and the stream is read, as on demand, until its end.
+    pub drain: bool,
 }
 
 /// Spawns a client request's body pipe once its stream exists.
@@ -468,13 +475,35 @@ impl Inner {
         self.wake_driver();
     }
 
+    /// The claim of `id`, settled without a tunnel (a non-2xx), is gone: it was the
+    /// reader of the detached body. The request is not aborted (a client finishes a
+    /// rejected CONNECT with FIN): what is queued goes, and the rest is read and dropped
+    /// until the end, also without read-ahead.
+    pub(crate) fn drain_reader(&mut self, id: StreamId) {
+        let closed = self.close.is_some();
+        let Some(r) = self.streams.get_mut(&id).map(|s| &mut s.recv) else {
+            return;
+        };
+        r.waker = None;
+        r.trailers = None;
+        let live = !(r.eof || r.error.is_some() || closed);
+        if live {
+            r.drain = true;
+            r.consumer_waiting = true; // demand reads, never handed a frame
+        }
+        self.discard_body(id);
+        if live {
+            self.mark_ready(id, Dir::Recv);
+        }
+    }
+
     /// Queue a body slice of `id`; `demand` counts it against the stream's reservation.
-    /// Bytes of an abandoned body (no reader) are dropped.
+    /// Bytes of an abandoned or drained body (no reader) are dropped.
     pub(crate) fn queue_body(&mut self, id: StreamId, b: Bytes, demand: bool) {
         let Some(st) = self
             .streams
             .get_mut(&id)
-            .filter(|s| !b.is_empty() && !s.recv.abandoned)
+            .filter(|s| !b.is_empty() && !s.recv.abandoned && !s.recv.drain)
         else {
             return;
         };

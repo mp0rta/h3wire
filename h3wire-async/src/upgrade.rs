@@ -61,6 +61,9 @@ impl Drop for Claim {
                         st.up = Up::None;
                         i.abort_local(id, H3Code::REQUEST_CANCELLED);
                     }
+                    // Settled without a tunnel: the claim was the (detached) body's
+                    // reader, and nothing reads the request now.
+                    Up::Failed(_) => i.drain_reader(id),
                     _ => {}
                 }
             }

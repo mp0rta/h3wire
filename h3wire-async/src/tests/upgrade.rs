@@ -797,3 +797,31 @@ fn claim_after_task_ended_resolves() {
     });
     assert!(matches!(r, Poll::Ready(Err(_))), "{r:?}");
 }
+
+/// Property-test regression: a claim settled without a tunnel (a non-2xx) was the request
+/// body's reader. Once its `OnUpgrade` is gone, the request must still end; here without
+/// read-ahead, so nothing else reads the client's FIN.
+#[test]
+fn failed_claim_does_not_strand_the_request() {
+    let mut sb = Builder::new();
+    sb.read_ahead(0);
+    let mut p = pair(&Builder::new(), &sb);
+    let exec = p.exec.clone();
+    let left = run(&exec, async {
+        let (resp, (mut req, tx)) = request(&mut p, connect()).await;
+        let info = req.extensions().get::<ConnInfo>().unwrap().clone();
+        let on = upgrade::on(&mut req);
+        drop(req);
+        tx.send(reply(404, "")).unwrap();
+        let e = on.await.expect_err("no tunnel");
+        assert!(matches!(e.kind(), ErrorKind::NotUpgraded), "{e:?}");
+        let mut resp = out(&resp).await.expect("a response");
+        assert_eq!(resp.status(), 404);
+        while let Some(f) = poll_fn(|cx| Pin::new(resp.body_mut()).poll_frame(cx)).await {
+            f.expect("no error");
+        }
+        quiesce().await;
+        info.__debug_buffers().0
+    });
+    assert!(left.is_empty(), "streams left: {left:?}");
+}
