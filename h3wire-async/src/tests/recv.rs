@@ -82,7 +82,9 @@ fn has_head(sh: &Shared, s: StreamId) -> bool {
 /// What Tasks 6–7 do on delivery: release the head, wake the stream, hand out the body.
 fn take_body(sh: &Shared, s: StreamId) -> RecvBody {
     sh.with(|i| {
-        let b = i.streams.get_mut(&s).unwrap().head.take().unwrap();
+        let st = i.streams.get_mut(&s).unwrap();
+        st.users += 1; // taken over by the body
+        let b = st.head.take().unwrap();
         i.conn.release(b);
         i.mark_ready(s, Dir::Recv);
     });

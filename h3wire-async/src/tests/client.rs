@@ -60,11 +60,11 @@ fn get(uri: &str) -> Request<String> {
     req(Method::GET, uri, String::new())
 }
 
-fn has(heads: &[(String, String)], name: &str, value: &str) -> bool {
+pub(super) fn has(heads: &[(String, String)], name: &str, value: &str) -> bool {
     heads.iter().any(|(n, v)| n == name && v == value)
 }
 
-fn seen(p: &Peer, s: StreamId) -> bool {
+pub(super) fn seen(p: &Peer, s: StreamId) -> bool {
     !p.headers(s).is_empty()
 }
 
@@ -77,7 +77,7 @@ fn err_kind(r: Resp) -> ErrorKind {
 }
 
 /// Poll `f` while stepping `peer` until `f` completes.
-async fn drive<F: Future + Unpin>(peer: &mut Peer, f: &mut F) -> F::Output {
+pub(super) async fn drive<F: Future + Unpin>(peer: &mut Peer, f: &mut F) -> F::Output {
     poll_fn(|cx| {
         loop {
             if let Poll::Ready(v) = Pin::new(&mut *f).poll(cx) {
@@ -92,7 +92,7 @@ async fn drive<F: Future + Unpin>(peer: &mut Peer, f: &mut F) -> F::Output {
 }
 
 /// Poll `f` (it must stay pending) while stepping `peer` until `pred` holds.
-async fn drive_until<F: Future + Unpin>(
+pub(super) async fn drive_until<F: Future + Unpin>(
     peer: &mut Peer,
     f: &mut F,
     mut pred: impl FnMut(&Peer) -> bool,
@@ -165,6 +165,8 @@ fn get_and_post_roundtrip() {
         assert_eq!(b, b"made");
         assert_eq!(t.unwrap()["x-t"], "1");
     });
+    // Every handle is gone and both directions ended: the entries are reaped.
+    assert_eq!(send.shared.with(|i| i.streams.len()), 0);
 }
 
 #[test]

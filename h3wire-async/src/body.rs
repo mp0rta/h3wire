@@ -6,9 +6,9 @@
 use crate::error::{BoxError, Error};
 use crate::http_map::trailer_fields;
 use crate::rt::{BoxTask, Cancelable, Executor, Owns};
-use crate::state::{Dir, End, Shared, assert_unlocked};
+use crate::state::{Dir, End, Inner, Shared, assert_unlocked};
 use bytes::{Buf, Bytes};
-use h3wire::{H3Code, StreamId};
+use h3wire::{FieldRef, H3Code, StreamId};
 use http_body::{Body, Frame};
 use std::future::poll_fn;
 use std::pin::{Pin, pin};
@@ -32,6 +32,7 @@ impl std::fmt::Debug for RecvBody {
 }
 
 impl RecvBody {
+    /// Takes over one of the entry's `users`, counted by the caller.
     pub(crate) fn new(shared: Shared, id: StreamId) -> Self {
         RecvBody { shared, id }
     }
@@ -47,6 +48,7 @@ impl Body for RecvBody {
     ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
         let id = self.id;
         self.shared.with(|i| {
+            continue_100(i, id);
             let close = i.close.as_ref().map(|c| c.to_error());
             let Some(r) = i.streams.get_mut(&id).map(|s| &mut s.recv) else {
                 return Poll::Ready(close.map(Err));
@@ -58,10 +60,12 @@ impl Body for RecvBody {
                 r.consumer_waiting = false;
                 let b = i.pop_body(id).expect("queue is not empty");
                 i.mark_ready(id, Dir::Recv); // room to read on
+                i.fire_cancels(id); // the last of a finished body: see `recv_consumed`
                 return Poll::Ready(Some(Ok(Frame::data(b))));
             }
             if let Some(t) = r.trailers.take() {
                 r.consumer_waiting = false;
+                i.fire_cancels(id);
                 return Poll::Ready(Some(Ok(Frame::trailers(t))));
             }
             if let Some(e) = r.error.take() {
@@ -85,12 +89,27 @@ impl Body for RecvBody {
 
     fn is_end_stream(&self) -> bool {
         self.shared.with(|i| {
-            i.streams.get(&self.id).is_some_and(|s| {
+            i.streams.get(&self.id).is_none_or(|s| {
                 let r = &s.recv;
                 r.detached
                     || (r.eof && r.queue.is_empty() && r.trailers.is_none() && r.error.is_none())
             })
         })
+    }
+}
+
+/// Server: answer `expect: 100-continue` with `:status 100`, once, unless a response was
+/// already sent (spec §4.2).
+fn continue_100(i: &mut Inner, id: StreamId) {
+    let Some(st) = i.streams.get_mut(&id) else {
+        return;
+    };
+    if std::mem::take(&mut st.expect_continue) && !st.final_sent && !st.send.done {
+        // Err: the stream or connection is already over.
+        let _ = i
+            .conn
+            .send_headers(id, &[FieldRef::new(b":status", b"100")], false);
+        i.mark_ready(id, Dir::Send);
     }
 }
 
@@ -102,21 +121,22 @@ impl Drop for RecvBody {
             let Some(r) = i.streams.get_mut(&id).map(|s| &mut s.recv) else {
                 return;
             };
-            if r.detached {
-                return;
+            if !r.detached {
+                r.waker = None;
+                r.consumer_waiting = false;
+                if r.eof || r.error.is_some() || closed {
+                    i.discard_body(id);
+                    i.wake_driver();
+                } else if r.task_owned {
+                    // The per-request task commits the abort when it ends.
+                    r.abandoned = true;
+                } else {
+                    // Err: not a live request stream any more; nothing to abort.
+                    let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);
+                    i.wake_driver();
+                }
             }
-            r.waker = None;
-            r.consumer_waiting = false;
-            if r.eof || r.error.is_some() || closed {
-                i.discard_body(id);
-            } else if r.task_owned {
-                r.abandoned = true;
-                return;
-            } else {
-                // Err: not a live request stream any more; nothing to abort.
-                let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);
-            }
-            i.wake_driver();
+            i.release_user(id);
         });
     }
 }

@@ -24,6 +24,7 @@ pub mod ext;
 mod http_map;
 pub mod quic;
 pub mod rt;
+pub mod server;
 #[allow(dead_code)]
 mod slot;
 #[allow(dead_code)]
@@ -36,3 +37,4 @@ pub use client::{ClientConnection, SendRequest};
 pub use error::{BoxError, DatagramError, Error, ErrorKind};
 /// The sans-I/O core; its types appear in this crate's API.
 pub use h3wire as core;
+pub use server::ServerConnection;

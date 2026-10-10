@@ -61,7 +61,7 @@ impl Executor<BoxTask> for BoxExec {
 
 /// Sends requests on a client connection; `Clone`.
 pub struct SendRequest<B> {
-    shared: Shared,
+    pub(crate) shared: Shared,
     exec: BoxExec,
     _body: PhantomData<fn(B)>,
 }
@@ -266,7 +266,12 @@ impl InFlight {
             }
         }
         let id = self.id.expect("set above");
-        (response(i, id, cx), gone)
+        let r = response(i, id, cx);
+        // Ok: our user passes to the `RecvBody`.
+        if let Poll::Ready(Err(_)) = r {
+            i.release_user(id);
+        }
+        (r, gone)
     }
 }
 
@@ -333,6 +338,7 @@ impl Drop for InFlight {
                 }
                 // Err: the stream or connection is already over.
                 let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);
+                i.release_user(id);
             }
             i.wake_driver();
             gone

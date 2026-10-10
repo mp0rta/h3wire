@@ -54,6 +54,10 @@ pub(crate) struct Driver<C: quic::Connection> {
     read_ahead: usize,
     read_ahead_cap: usize,
     demand_chunk: usize,
+    /// Server: accept new bidi streams (the Service is ready, or shutting down).
+    pub(crate) accept_bidi: bool,
+    /// Server: graceful shutdown sent its final GOAWAY cutoff (`finish_shutdown`).
+    cutoff_sent: bool,
 }
 
 // No field is ever pinned.
@@ -80,6 +84,8 @@ impl<C: quic::Connection> Driver<C> {
             read_ahead: b.read_ahead,
             read_ahead_cap: b.read_ahead_cap,
             demand_chunk: b.demand_chunk.max(1),
+            accept_bidi: true,
+            cutoff_sent: false,
         }
     }
 
@@ -135,31 +141,37 @@ impl<C: quic::Connection> Driver<C> {
         moved |= self.write_sendable(budget)?;
         moved |= self.serve_ready(budget)?;
         self.shared.with(dispatch_events);
-        if self.shared.with(|i| i.graceful) && self.drained() {
-            self.close_no_error();
+        let cutoff = self.role == Role::Client || self.cutoff_sent;
+        if cutoff && self.shared.with(|i| i.graceful) && self.drained() {
+            self.close(H3Code::NO_ERROR);
             return Ok(true);
         }
         Ok(moved)
     }
 
-    /// Every request is over: none waits for its stream, and on each stream the response
-    /// head was taken, the receive side ended and the send half is acknowledged or reset.
+    /// Every request is over: none waits for its stream; on every stream with an entry
+    /// the head was taken and the receive side ended; and every request send half is
+    /// acknowledged or reset (checked on the halves: a reaped entry may still have one).
     fn drained(&self) -> bool {
-        self.shared.with(|i| {
-            i.opens.values().all(|o| o.done.is_some())
-                && i.streams.iter().all(|(id, st)| {
-                    st.head.is_none() && st.recv_terminal() && !self.sends.contains_key(id)
-                })
-        })
+        !self.sends.keys().any(|id| id.is_request())
+            && self.shared.with(|i| {
+                i.opens.values().all(|o| o.done.is_some())
+                    && i.streams
+                        .values()
+                        .all(|st| st.head.is_none() && st.recv_terminal())
+            })
     }
 
-    /// Close the connection with `H3_NO_ERROR` and fail every handle.
-    fn close_no_error(&mut self) {
-        self.conn.close(H3Code::NO_ERROR.0);
+    /// Close the connection with `code` and fail every handle (no-op once closed).
+    pub(crate) fn close(&mut self, code: H3Code) {
+        if self.shared.with(|i| i.close.is_some()) {
+            return;
+        }
+        self.conn.close(code.0);
         self.shared.with(|i| {
             i.conn.transport_closed();
             i.fail(CloseCause::H3 {
-                code: H3Code::NO_ERROR,
+                code,
                 by_peer: false,
             });
         });
@@ -246,8 +258,8 @@ impl<C: quic::Connection> Driver<C> {
             self.recvs.insert(id, r);
             self.shared.with(|i| i.push_ready(id, Dir::Recv));
         }
-        // Task 7 gates this on `Service::poll_ready`.
-        while *budget > 0 {
+        // Server: gated on `Service::poll_ready` (spec §3.1).
+        while *budget > 0 && (self.role == Role::Client || self.accept_bidi) {
             let Poll::Ready(r) = self.conn.poll_accept_bidi(cx) else {
                 break;
             };
@@ -302,7 +314,12 @@ impl<C: quic::Connection> Driver<C> {
                 o.done = Some(res.map(|()| id).map_err(|e| ErrorKind::Usage(e).into()));
                 i.pending_wakers.extend(o.waker.take());
                 if sent {
-                    i.streams.insert(id, StreamState::new());
+                    // The user is the request's `InFlight`.
+                    let st = StreamState {
+                        users: 1,
+                        ..StreamState::new()
+                    };
+                    i.streams.insert(id, st);
                     i.push_ready(id, Dir::Recv);
                     i.push_ready(id, Dir::Send);
                 }
@@ -390,6 +407,9 @@ fn dispatch_events(i: &mut Inner) {
                         st.discovering = false;
                         st.head = Some(block);
                         i.pending_wakers.extend(st.recv.waker.take());
+                        if kind == HeadersKind::Request {
+                            i.incoming.push_back(stream);
+                        }
                     } else {
                         i.conn.release(block);
                     }
@@ -471,6 +491,18 @@ impl<C: quic::Connection> Future for Driver<C> {
                 return Poll::Pending;
             }
             if !moved {
+                // Server graceful shutdown: the cutoff goes out after a full pass that
+                // started after GOAWAY(2^62-4), so requests already received count as
+                // processed (spec §4.2).
+                if this.role == Role::Server
+                    && !this.cutoff_sent
+                    && this.shared.with(|i| i.graceful)
+                {
+                    this.cutoff_sent = true;
+                    // Err: closed; the next outcome check returns.
+                    let _ = this.shared.with(|i| i.conn.finish_shutdown());
+                    continue;
+                }
                 return Poll::Pending;
             }
         }
@@ -479,8 +511,6 @@ impl<C: quic::Connection> Future for Driver<C> {
 
 impl<C: quic::Connection> Drop for Driver<C> {
     fn drop(&mut self) {
-        if self.shared.with(|i| i.close.is_none()) {
-            self.close_no_error();
-        }
+        self.close(H3Code::NO_ERROR);
     }
 }

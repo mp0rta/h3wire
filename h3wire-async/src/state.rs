@@ -60,6 +60,16 @@ pub(crate) struct StreamState {
     pub send: SendState,
     /// Executor tasks owning directions of this stream (spec §4.6).
     pub cancels: Vec<(Owns, CancelToken)>,
+    /// Handles that still read this entry: a client `InFlight`, a `RecvBody`, a server
+    /// per-request task. At 0, with both directions terminal, the entry is reaped.
+    pub users: usize,
+    /// Server: the final response HEADERS were queued (1xx not counted), or the peer
+    /// stopped the response first, so there is nothing to send.
+    pub final_sent: bool,
+    /// Server: the response-body pipe failed (a body error, or a panic during it).
+    pub task_failed: bool,
+    /// Server: the request carries `expect: 100-continue`, not answered yet.
+    pub expect_continue: bool,
 }
 
 impl StreamState {
@@ -70,11 +80,23 @@ impl StreamState {
             recv: RecvState::default(),
             send: SendState::default(),
             cancels: Vec::new(),
+            users: 0,
+            final_sent: false,
+            task_failed: false,
+            expect_continue: false,
         }
     }
 
     pub(crate) fn recv_terminal(&self) -> bool {
         self.recv.eof || self.recv.error.is_some()
+    }
+
+    /// The receive side is over for its reader too: an error, or the end with nothing
+    /// left to read. `Owns::Both` waits for this, so a Service still reading the tail of a
+    /// finished request is not cancelled.
+    fn recv_consumed(&self) -> bool {
+        let r = &self.recv;
+        r.error.is_some() || (r.eof && r.queue.is_empty() && r.trailers.is_none())
     }
 }
 
@@ -154,6 +176,8 @@ pub(crate) struct Inner {
     /// Graceful shutdown started: no new requests; the driver closes once drained.
     pub graceful: bool,
     pub streams: HashMap<StreamId, StreamState>,
+    /// Server: streams whose request head was delivered, waiting for dispatch.
+    pub incoming: VecDeque<StreamId>,
     /// Readiness tokens pushed by transport wakers, deduplicated by `ready_set`.
     pub ready: VecDeque<(StreamId, Dir)>,
     pub ready_set: HashSet<(StreamId, Dir)>,
@@ -252,12 +276,13 @@ impl Inner {
         t
     }
 
-    /// Fire the tokens of `id` whose directions are now terminal.
+    /// Fire the tokens of `id` whose directions are now terminal, then reap the entry if
+    /// nothing needs it any more.
     pub(crate) fn fire_cancels(&mut self, id: StreamId) {
         let Some(st) = self.streams.get_mut(&id) else {
             return;
         };
-        let (send, both) = (st.send.done, st.send.done && st.recv_terminal());
+        let (send, both) = (st.send.done, st.send.done && st.recv_consumed());
         st.cancels.retain(|(owns, t)| {
             let fire = match owns {
                 Owns::Both => both,
@@ -268,6 +293,40 @@ impl Inner {
             }
             !fire
         });
+        self.reap(id);
+    }
+
+    /// A handle of `id` is gone (see `StreamState::users`).
+    pub(crate) fn release_user(&mut self, id: StreamId) {
+        if let Some(st) = self.streams.get_mut(&id) {
+            st.users -= 1;
+        }
+        self.fire_cancels(id);
+    }
+
+    /// Remove `id`'s entry once no handle reads it and both directions are terminal,
+    /// with everything it still holds: queued body bytes (their budget goes back), an
+    /// undelivered head, retained raw bytes. The driver's transport halves are separate
+    /// (a send half stays until acknowledged or reset).
+    pub(crate) fn reap(&mut self, id: StreamId) {
+        if !self
+            .streams
+            .get(&id)
+            .is_some_and(|st| st.users == 0 && st.send.done && st.recv_terminal())
+        {
+            return;
+        }
+        let waiters = self.cap_waiters.len();
+        self.discard_body(id);
+        if self.cap_waiters.len() < waiters {
+            self.wake_driver();
+        }
+        let st = self.streams.remove(&id).expect("checked above");
+        if let Some(b) = st.head {
+            self.conn.release(b);
+        }
+        self.retained.remove(&id);
+        self.cap_waiters.remove(&id);
     }
 
     /// The send side of `id` is over (finished, stopped, reset or aborted): drop what is
@@ -372,6 +431,7 @@ impl Shared {
             peer_goaway: false,
             graceful: false,
             streams: HashMap::new(),
+            incoming: VecDeque::new(),
             ready: VecDeque::new(),
             ready_set: HashSet::new(),
             driver_waker: None,
