@@ -1,0 +1,38 @@
+name: Interop
+
+# The Docker interop matrix and h3spec (docs/interop.md). Not run on pull requests.
+# For a release, dispatch it on the release-candidate tag: an earlier green run does
+# not count.
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to test (the release-candidate tag for a release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: interop/run.sh
+      - if: always()
+        run: cat target/interop-report.md >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-report
+          path: |
+            target/interop-report.md
+            target/interop/out/*.log
+            target/interop/h3spec.txt
+            target/interop/h3wire-server.log

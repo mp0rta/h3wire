@@ -1,5 +1,18 @@
 [licenses]
-allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    # ring ("Apache-2.0 AND ISC"), rustls-webpki, untrusted: h3wire-quinn's dev-deps
+    # (quinn with rustls-ring, rcgen).
+    "ISC",
+    # subtle (via rustls): h3wire-quinn's dev-deps.
+    "BSD-3-Clause",
+]
 
 [bans]
 multiple-versions = "warn"
+
+# Cargo.lock pins `time` >= 0.3.47 (RUSTSEC-2026-0009), which needs rustc 1.88: this is why
+# the msrv job only builds h3wire-quinn (no dev-deps). If a `cargo update` under the
+# MSRV-aware resolver falls back below 0.3.47, `cargo deny check advisories` fails.

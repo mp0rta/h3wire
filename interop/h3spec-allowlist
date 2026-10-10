@@ -1,0 +1,9 @@
+# Expected h3spec failures (interop/run.sh). One case per line:
+#   <case-id>  <quic|h3>  <RFC § rationale>
+# The case id is the source location h3spec prints for the case under "Failures:"
+# (it is unique; two cases share a description). It is valid for the pinned h3spec
+# binary only (versions.env); re-check every id when h3spec is bumped.
+# quic: the QUIC/TLS layer is quinn (with rustls), not h3wire. h3: our decision.
+TransportError.hs:245:32  quic  RFC 9001 §8.2: transport parameters under the draft codepoint 0xffa5 instead of 0x39 should get missing_extension; rustls (through quinn) also accepts the draft codepoint, so the handshake goes on. Attributed to quinn/rustls.
+HTTP3Error.hs:216:21  h3  RFC 9114 §7.1 and §7.2.6: the case sends GOAWAY with a declared length of 2^30. A GOAWAY payload is exactly one varint (at most 8 bytes), so a longer payload is a frame payload error, which §7.1 says MUST be H3_FRAME_ERROR; we close with it at the frame header, nothing buffered. h3spec expects H3_EXCESSIVE_LOAD.
+HTTP3Error.hs:277:21  h3  RFC 9204 §4.3.1: the case sends 0x3f (Set Dynamic Table Capacity of at least 31) and then FIN. We send no SETTINGS_QPACK_MAX_TABLE_CAPACITY, so our limit is its default 0 (§5), and that octet alone exceeds our limit, which MUST be QPACK_ENCODER_STREAM_ERROR; it is detected before the FIN. h3spec expects H3_CLOSED_CRITICAL_STREAM (§4.2) for the closure.

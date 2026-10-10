@@ -1,0 +1,32 @@
+[package]
+name = "h3wire-async"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Runtime-neutral async HTTP/3 over the sans-I/O h3wire core"
+repository = "https://github.com/mp0rta/h3wire"
+documentation = "https://docs.rs/h3wire-async"
+readme = "README.md"
+keywords = ["http3", "quic", "async", "masque"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+# Provides `rt::TokioExecutor`. The only way tokio enters the normal dependencies.
+tokio = ["dep:tokio"]
+# UNSTABLE, internal-only: test support for this workspace's sibling crates
+# (`__testing` module). Not public API; may change or vanish in any release.
+__testing = []
+
+[dependencies]
+h3wire = { path = "../h3wire", version = "0.1.0" }
+http = "1"
+http-body = "1"
+bytes = "1"
+futures-core = "0.3"
+tower-service = "0.3"
+tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+futures = "0.3"
+proptest = "1"

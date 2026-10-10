@@ -30,6 +30,7 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p h3wire-async --all-targets --features tokio -- -D warnings
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
   test:
@@ -39,10 +40,34 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
-      - name: Verify the published package
+      - run: cargo test -p h3wire-async --features tokio
+      - name: Verify the published packages
         run: |
-          cargo package --locked
-          cargo test --manifest-path target/package/h3wire-*/Cargo.toml --locked
+          cargo package --workspace --locked
+          # `cargo package --workspace` also builds each packaged crate. A standalone test
+          # of the packaged h3wire-async (and so h3wire-quinn) resolves h3wire from
+          # crates.io, checksum-checked against the local package: it can join this loop
+          # only while the local h3wire is byte-identical to a published h3wire version.
+          # Today it differs from crates.io 0.1.0 by SPDX comment lines; a 0.1.x core
+          # republish would fix that.
+          for c in h3wire; do
+            cargo test --manifest-path target/package/$c-[0-9]*/Cargo.toml --locked
+          done
+
+  async-runtime-free:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p h3wire-async --no-default-features
+      # As a normal dependency, without dev-deps.
+      - run: cargo check -p h3wire-async --features __testing
+      # Fail-closed: a failing `cargo tree` fails the step (bash -e) instead of counting 0.
+      - run: |
+          cargo tree -p h3wire-async -e normal --no-default-features > tree.txt
+          grep -q '^h3wire-async' tree.txt
+          ! grep -q tokio tree.txt
 
   msrv:
     if: github.event_name != 'schedule'
@@ -50,7 +75,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
-      - run: cargo build -p h3wire
+      - run: cargo build -p h3wire -p h3wire-async --locked
+      - run: cargo build -p h3wire-async --features tokio --locked
+      # Build-only: h3wire-quinn's dev-dep tree (time >= 0.3.47) needs a newer rustc.
+      - run: cargo build -p h3wire-quinn --locked
 
   deny:
     if: github.event_name != 'schedule'
