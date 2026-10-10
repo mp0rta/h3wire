@@ -18,10 +18,10 @@ mod recv;
 mod send;
 
 use crate::builder::Builder;
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
+use crate::http_map::headers_from_block;
 use crate::quic::{self, RecvStream, SendStream, TransportError};
 use crate::state::{CloseCause, Dir, Inner, Shared, StreamState};
-use bytes::Bytes;
 use h3wire::{Action, Event, H3Code, HeadersKind, Role, StreamId, UniKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -36,8 +36,6 @@ pub(crate) struct Driver<C: quic::Connection> {
     /// Kept after `FinishStream` until `poll_stopped` resolves or the stream is reset.
     sends: HashMap<StreamId, C::Send>,
     recvs: HashMap<StreamId, C::Recv>,
-    /// Raw bytes read but not fed to the core yet, with FIN.
-    retained: HashMap<StreamId, (Bytes, bool)>,
     /// `Action::OpenUni` kinds waiting for `poll_open_uni`.
     open_uni: VecDeque<UniKind>,
     /// Streams whose last write pended: skipped until their `Send` token fires.
@@ -45,6 +43,10 @@ pub(crate) struct Driver<C: quic::Connection> {
     work_budget: usize,
     /// Header-discovery read size: `max_encoded_field_section_size + 16`.
     discovery_len: usize,
+    /// Per-stream read-ahead, connection cap `C` and demand chunk `D` (§3.2).
+    read_ahead: usize,
+    read_ahead_cap: usize,
+    demand_chunk: usize,
 }
 
 // No field is ever pinned.
@@ -60,12 +62,38 @@ impl<C: quic::Connection> Driver<C> {
             role,
             sends: HashMap::new(),
             recvs: HashMap::new(),
-            retained: HashMap::new(),
             open_uni: VecDeque::new(),
             write_blocked: HashSet::new(),
             work_budget: b.work_budget.max(1),
             discovery_len,
+            read_ahead: b.read_ahead,
+            read_ahead_cap: b.read_ahead_cap,
+            demand_chunk: b.demand_chunk.max(1),
         }
+    }
+
+    /// Test hook until `SendRequest` exists (Task 6): open a request stream and queue its
+    /// HEADERS.
+    #[cfg(test)]
+    pub(crate) fn open_request(&mut self, fields: &[(&str, &str)], end: bool) -> StreamId {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let Poll::Ready(Ok((s, r))) = self.conn.poll_open_bidi(&mut cx) else {
+            panic!("no stream credit");
+        };
+        let id = s.id();
+        self.sends.insert(id, s);
+        self.recvs.insert(id, r);
+        let f: Vec<h3wire::FieldRef> = fields
+            .iter()
+            .map(|(n, v)| h3wire::FieldRef::new(n.as_bytes(), v.as_bytes()))
+            .collect();
+        self.shared.with(|i| {
+            i.conn.send_headers(id, &f, end).unwrap();
+            i.streams.insert(id, StreamState::new());
+            i.push_ready(id, Dir::Recv);
+            i.push_ready(id, Dir::Send);
+        });
+        id
     }
 
     pub(crate) fn shared(&self) -> Shared {
@@ -118,7 +146,7 @@ impl<C: quic::Connection> Driver<C> {
                     if let Some(mut r) = self.recvs.remove(&stream) {
                         r.stop(code.0);
                     }
-                    self.retained.remove(&stream);
+                    self.shared.with(|i| i.retained.remove(&stream));
                 }
                 Action::FinishStream(s) => {
                     if let Some(s) = self.sends.get_mut(&s) {
@@ -228,6 +256,7 @@ impl<C: quic::Connection> Driver<C> {
 /// Drain the core's events into per-stream state.
 fn dispatch_events(i: &mut Inner) {
     while let Some(e) = i.conn.poll_event() {
+        let retryable = e.retryable();
         match e {
             Event::PeerSettings => i.wake_conn(),
             Event::Headers {
@@ -235,8 +264,25 @@ fn dispatch_events(i: &mut Inner) {
                 block,
                 kind,
             } => match kind {
-                // Task 4 delivers 1xx and trailers; a 1xx does not end discovery.
-                HeadersKind::Informational | HeadersKind::Trailers => i.conn.release(block),
+                // A 1xx does not end discovery; `send_request` ignores it (§4.3).
+                HeadersKind::Informational => i.conn.release(block),
+                HeadersKind::Trailers => {
+                    let map = i.conn.headers(block).map(|h| headers_from_block(&h));
+                    i.conn.release(block);
+                    match map {
+                        Ok(Ok(map)) => {
+                            if let Some(st) = i.streams.get_mut(&stream) {
+                                st.recv.trailers = Some(map);
+                                i.pending_wakers.extend(st.recv.waker.take());
+                            }
+                        }
+                        // Not representable as `http` headers; Err: the core is closed.
+                        Ok(Err(code)) => {
+                            let _ = i.conn.abort(stream, code);
+                        }
+                        Err(_) => {}
+                    }
+                }
                 HeadersKind::Request | HeadersKind::Response => {
                     if let Some(st) = i.streams.get_mut(&stream) {
                         st.discovering = false;
@@ -246,8 +292,33 @@ fn dispatch_events(i: &mut Inner) {
                     }
                 }
             },
-            // Terminal stream events, GOAWAY and uni stream types are dispatched by
-            // Tasks 4–9; `Closed` is handled where the cause is known.
+            Event::Finished(stream) => {
+                if let Some(st) = i.streams.get_mut(&stream) {
+                    st.recv.eof = true;
+                    i.pending_wakers.extend(st.recv.waker.take());
+                }
+            }
+            Event::StreamAborted {
+                stream,
+                code,
+                source,
+            } => {
+                i.discard_body(stream);
+                if let Some(st) = i.streams.get_mut(&stream) {
+                    st.recv.trailers = None;
+                    st.recv.error = Some(
+                        ErrorKind::StreamAborted {
+                            code,
+                            source,
+                            retryable,
+                        }
+                        .into(),
+                    );
+                    i.pending_wakers.extend(st.recv.waker.take());
+                }
+            }
+            // GOAWAY, SendStopped and uni stream types are dispatched by Tasks 5–9;
+            // `Closed` is handled where the cause is known.
             _ => {}
         }
     }

@@ -11,6 +11,7 @@
 #[doc(hidden)]
 #[path = "testing/mod.rs"]
 pub mod __testing;
+pub mod body;
 pub mod builder;
 // Driver, shared state and OnceSlot are wired up by the client and server (Tasks 6–9).
 #[allow(dead_code)]

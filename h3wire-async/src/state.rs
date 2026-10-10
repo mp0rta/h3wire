@@ -7,7 +7,9 @@
 
 use crate::error::{Error, ErrorKind};
 use crate::quic::TransportError;
+use bytes::Bytes;
 use h3wire::{Connection, H3Code, HeaderBlockId, StreamId};
+use http::HeaderMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Wake, Waker};
@@ -45,15 +47,16 @@ impl CloseCause {
 
 /// Per-stream protocol state. The QUIC objects live in the driver.
 ///
-/// Task 4 adds `recv` (body queue, tiers, waker), Task 5 adds `send` (queue, admission,
-/// waker) and the cancel tokens.
+/// Task 5 adds `send` (queue, admission, waker) and the cancel tokens.
 #[derive(Debug)]
 pub(crate) struct StreamState {
     /// Header discovery is running: the request (server) or final response (client)
     /// HEADERS has not been delivered yet.
     pub discovering: bool,
-    /// The delivered request/response head, held until the application takes it.
+    /// The delivered request/response head, held until the application takes it. Whoever
+    /// releases it must `mark_ready(id, Dir::Recv)`: a stream paused on it feeds again.
     pub head: Option<HeaderBlockId>,
+    pub recv: RecvState,
 }
 
 impl StreamState {
@@ -61,8 +64,36 @@ impl StreamState {
         StreamState {
             discovering: true,
             head: None,
+            recv: RecvState::default(),
         }
     }
+}
+
+/// The receive side of a request stream (spec §3.2, §4.4).
+#[derive(Debug, Default)]
+pub(crate) struct RecvState {
+    /// Parsed body bytes, oldest first. Bytes of a demand read sit at the front.
+    pub queue: VecDeque<Bytes>,
+    pub queued: usize,
+    /// The part of `queued` counted against the connection's read-ahead cap.
+    pub speculative: usize,
+    /// A demand reservation: `Some(n)` with `n` bytes of it still queued; while the queue
+    /// is empty, the demand read is in flight.
+    pub reservation: Option<usize>,
+    /// The core finished the receive side (`Event::Finished`), or the error was yielded.
+    pub eof: bool,
+    pub trailers: Option<HeaderMap>,
+    pub error: Option<Error>,
+    /// Receive ownership moved to a tunnel (Task 8): the `RecvBody` is an ended body that
+    /// never aborts; queued bytes stay for the tunnel.
+    pub detached: bool,
+    pub waker: Option<Waker>,
+    /// A consumer found the queue empty and has not been handed a frame since.
+    pub consumer_waiting: bool,
+    /// Task 7: a live per-request task owns the body. Dropping it then only sets
+    /// `abandoned`; the task commits the abort when it ends.
+    pub task_owned: bool,
+    pub abandoned: bool,
 }
 
 pub(crate) struct Inner {
@@ -77,6 +108,12 @@ pub(crate) struct Inner {
     /// Connection-level waiters (`ConnInfo::settings`): woken on SETTINGS and on close.
     pub conn_wakers: Vec<Waker>,
     pub close: Option<CloseCause>,
+    /// Raw request-stream bytes read but not fed to the core yet, with FIN (§3.2).
+    pub retained: HashMap<StreamId, (Bytes, bool)>,
+    /// Speculative (read-ahead) body bytes queued on every stream; capped by `C`.
+    pub speculative: usize,
+    /// Streams with read-ahead room that the connection cap holds back.
+    pub cap_waiters: HashSet<StreamId>,
 }
 
 impl Inner {
@@ -119,7 +156,54 @@ impl Inner {
     pub(crate) fn fail(&mut self, cause: CloseCause) {
         self.close.get_or_insert(cause);
         self.wake_conn();
-        // Tasks 4–9 also wake every per-stream waker here.
+        for st in self.streams.values_mut() {
+            self.pending_wakers.extend(st.recv.waker.take());
+        }
+    }
+
+    /// Queue a body slice of `id`; `demand` counts it against the stream's reservation.
+    pub(crate) fn queue_body(&mut self, id: StreamId, b: Bytes, demand: bool) {
+        let Some(st) = self.streams.get_mut(&id).filter(|_| !b.is_empty()) else {
+            return;
+        };
+        let r = &mut st.recv;
+        r.queued += b.len();
+        match (demand, &mut r.reservation) {
+            (true, Some(n)) => *n += b.len(),
+            _ => {
+                r.speculative += b.len();
+                self.speculative += b.len();
+            }
+        }
+        r.queue.push_back(b);
+        self.pending_wakers.extend(r.waker.take());
+    }
+
+    /// Pop the next body chunk of `id`, giving its budget back. Does not wake the driver.
+    pub(crate) fn pop_body(&mut self, id: StreamId) -> Option<Bytes> {
+        let r = &mut self.streams.get_mut(&id)?.recv;
+        let b = r.queue.pop_front()?;
+        r.queued -= b.len();
+        match r.reservation {
+            // Demand bytes are at the front, and a chunk is never split between tiers.
+            Some(n) if n > 0 => r.reservation = (n > b.len()).then(|| n - b.len()),
+            _ => {
+                r.speculative -= b.len();
+                self.speculative -= b.len();
+                for w in std::mem::take(&mut self.cap_waiters) {
+                    self.push_ready(w, Dir::Recv);
+                }
+            }
+        }
+        Some(b)
+    }
+
+    /// Drop everything queued on `id` and its reservation. Does not wake the driver.
+    pub(crate) fn discard_body(&mut self, id: StreamId) {
+        while self.pop_body(id).is_some() {}
+        if let Some(st) = self.streams.get_mut(&id) {
+            st.recv.reservation = None;
+        }
     }
 }
 
@@ -167,6 +251,9 @@ impl Shared {
             pending_wakers: Vec::new(),
             conn_wakers: Vec::new(),
             close: None,
+            retained: HashMap::new(),
+            speculative: 0,
+            cap_waiters: HashSet::new(),
         })))
     }
 

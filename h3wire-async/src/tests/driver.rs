@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-type Out<T> = Arc<Mutex<Option<T>>>;
+pub(super) type Out<T> = Arc<Mutex<Option<T>>>;
 
 /// A driver of `role` on its side of a mock pair, and a `CorePeer` on the other side.
-fn setup(
+pub(super) fn setup(
     role: Role,
     b: &Builder,
     peer_cfg: Config,
@@ -35,7 +35,7 @@ fn setup(
 }
 
 /// Spawn `fut` on `exec`; its output lands in the returned slot.
-fn spawn<T: Send + 'static>(
+pub(super) fn spawn<T: Send + 'static>(
     exec: &TestExec,
     fut: impl Future<Output = T> + Send + 'static,
 ) -> Out<T> {
@@ -48,16 +48,16 @@ fn spawn<T: Send + 'static>(
     out
 }
 
-fn done<T>(o: &Out<T>) -> bool {
+pub(super) fn done<T>(o: &Out<T>) -> bool {
     o.lock().unwrap().is_some()
 }
 
-fn take<T>(o: &Out<T>) -> T {
+pub(super) fn take<T>(o: &Out<T>) -> T {
     o.lock().unwrap().take().unwrap()
 }
 
 /// Poll `f` once.
-async fn poll_once<F: Future + Unpin>(f: &mut F) -> Poll<F::Output> {
+pub(super) async fn poll_once<F: Future + Unpin>(f: &mut F) -> Poll<F::Output> {
     poll_fn(|cx| Poll::Ready(Pin::new(&mut *f).poll(cx))).await
 }
 

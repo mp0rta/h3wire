@@ -52,6 +52,20 @@ impl ConnInfo {
         self.shared.with(|i| i.conn.peer_settings().cloned())
     }
 
+    /// Receive accounting for the bound oracle: (queued body bytes, streams holding a
+    /// demand reservation, retained raw bytes). Not public API.
+    #[doc(hidden)]
+    pub fn __debug_recv_accounting(&self) -> (usize, usize, usize) {
+        self.shared.with(|i| {
+            let r = i.streams.values().map(|s| &s.recv);
+            (
+                r.clone().map(|r| r.queued).sum(),
+                r.filter(|r| r.reservation.is_some()).count(),
+                i.retained.values().map(|(b, _)| b.len()).sum(),
+            )
+        })
+    }
+
     /// Wait for the peer's SETTINGS; `None` if the connection closes first.
     pub async fn settings(&self) -> Option<PeerSettings> {
         poll_fn(|cx| {
