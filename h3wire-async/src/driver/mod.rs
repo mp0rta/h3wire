@@ -211,6 +211,8 @@ impl<C: quic::Connection> Driver<C> {
                     self.shared.with(|i| i.retained.remove(&stream));
                 }
                 Action::FinishStream(id) => {
+                    #[cfg(test)]
+                    self.shared.with(|i| i.fin_actions.insert(id));
                     if let Some(s) = self.sends.get_mut(&id) {
                         s.finish();
                         self.finished.insert(id);

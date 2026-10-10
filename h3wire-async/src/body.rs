@@ -37,6 +37,11 @@ impl RecvBody {
     pub(crate) fn new(shared: Shared, id: StreamId) -> Self {
         RecvBody { shared, id }
     }
+
+    #[cfg(test)]
+    pub(crate) fn stream_id(&self) -> StreamId {
+        self.id
+    }
 }
 
 impl Body for RecvBody {

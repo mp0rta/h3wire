@@ -191,6 +191,7 @@ dependencies = [
  "h3wire",
  "http",
  "http-body",
+ "proptest",
  "tokio",
  "tower-service",
 ]

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 83680520ff1ee63d301e4e33b5c933f0b0ad1c9d61f8b15f3d203f315af3f277 # shrinks to (Limits { read_ahead: 0, cap: 0, demand: 1, send: 1, field: 300, budget: 1, dq: 1, stream_cap: (1, 1), conn_cap: (1, 1) }, Limits { read_ahead: 0, cap: 0, demand: 1, send: 1, field: 300, budget: 1, dq: 1, stream_cap: (1, 1), conn_cap: (1, 1) }, [Request { kind: Connect, dgram: false }, Respond { k: 0, status: 200, body: true }, Read(Server, 0), Upgrade(Server, 0)])
+cc b10789a64b2161283fe46ccc1aac64ed93998a4e3bf222cda2115a3823872bf5 # shrinks to (Limits { read_ahead: 1, cap: 1, demand: 1, send: 1, field: 300, budget: 1, dq: 1, stream_cap: (1, 1), conn_cap: (1, 1) }, Limits { read_ahead: 0, cap: 0, demand: 1, send: 1, field: 300, budget: 1, dq: 1, stream_cap: (1, 1), conn_cap: (1, 1) }, [Request { kind: Get, dgram: false }, Request { kind: Get, dgram: false }, Respond { k: 7, status: 200, body: true }, Request { kind: Get, dgram: false }, Send(Server, 4, 200)])
+cc d8a13ddd68a63db95d440f815fcf08064ea3af347633a323f4d49930739dfa49 # shrinks to (Limits { read_ahead: 1, cap: 1, demand: 1, send: 1, field: 300, budget: 1, dq: 1, stream_cap: (1, 40), conn_cap: (1, 40) }, Limits { read_ahead: 1, cap: 1, demand: 1, send: 1, field: 300, budget: 1, dq: 1, stream_cap: (1, 1), conn_cap: (1, 1) }, [Request { kind: Get, dgram: false }, Accept(0), Request { kind: Get, dgram: false }, Accept(0), Request { kind: Get, dgram: false }, Respond { k: 0, status: 200, body: true }, Abort(Client, 0), Register(Server, 0), Shutdown(Client), DgSend(Server, 2, 0)])

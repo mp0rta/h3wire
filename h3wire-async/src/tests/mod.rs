@@ -5,6 +5,7 @@ mod datagram;
 mod driver;
 mod http_map;
 mod mock;
+mod props;
 mod recv;
 mod send;
 mod server;

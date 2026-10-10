@@ -9,8 +9,9 @@ use futures::stream::FuturesUnordered;
 use std::future::{Future, poll_fn};
 use std::panic::AssertUnwindSafe;
 use std::pin::pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Poll, Waker};
+use std::task::{Context, Poll, Waker};
 
 #[derive(Default)]
 struct Inner {
@@ -18,6 +19,8 @@ struct Inner {
     incoming: Mutex<Vec<BoxTask>>,
     set: Mutex<FuturesUnordered<BoxTask>>,
     waker: Mutex<Option<Waker>>,
+    /// Tasks that panicked.
+    panics: AtomicUsize,
 }
 
 /// Runs spawned tasks inside [`run`]. A panicking task is dropped, as tokio does.
@@ -26,11 +29,44 @@ pub struct TestExec(Arc<Inner>);
 
 impl Executor<BoxTask> for TestExec {
     fn execute(&self, fut: BoxTask) {
-        let task = AssertUnwindSafe(fut).catch_unwind().map(|_| ());
+        // Weak: the task lives inside `Inner`.
+        let inner = Arc::downgrade(&self.0);
+        let task = AssertUnwindSafe(fut).catch_unwind().map(move |r| {
+            if let (Err(_), Some(i)) = (r, inner.upgrade()) {
+                i.panics.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         self.0.incoming.lock().unwrap().push(Box::pin(task));
         if let Some(w) = self.0.waker.lock().unwrap().take() {
             w.wake();
         }
+    }
+}
+
+impl TestExec {
+    /// Poll every runnable task (spawned ones included) until none is ready; their
+    /// wakes and new spawns go to `cx`. For tests that step the world themselves.
+    pub fn tick(&self, cx: &mut Context<'_>) {
+        *self.0.waker.lock().unwrap() = Some(cx.waker().clone());
+        loop {
+            let mut set = self.0.set.lock().unwrap();
+            set.extend(self.0.incoming.lock().unwrap().drain(..));
+            while let Poll::Ready(Some(())) = set.poll_next_unpin(cx) {}
+            drop(set);
+            if self.0.incoming.lock().unwrap().is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Tasks spawned and not finished.
+    pub fn pending(&self) -> usize {
+        self.0.set.lock().unwrap().len() + self.0.incoming.lock().unwrap().len()
+    }
+
+    /// Tasks that panicked (each was dropped).
+    pub fn panics(&self) -> usize {
+        self.0.panics.load(Ordering::Relaxed)
     }
 }
 

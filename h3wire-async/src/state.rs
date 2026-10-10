@@ -244,6 +244,9 @@ pub(crate) struct Inner {
     pub send_capacity: usize,
     /// HTTP datagram queues and limits (spec §3.4).
     pub dgram: Dgrams,
+    /// Streams whose `Action::FinishStream` the driver executed (property-test oracle).
+    #[cfg(test)]
+    pub fin_actions: HashSet<StreamId>,
 }
 
 impl Inner {
@@ -570,6 +573,8 @@ impl Shared {
             cap_waiters: HashSet::new(),
             send_capacity: 64 * 1024,
             dgram: Dgrams::default(),
+            #[cfg(test)]
+            fin_actions: HashSet::new(),
         })))
     }
 

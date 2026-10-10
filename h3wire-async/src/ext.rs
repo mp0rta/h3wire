@@ -4,7 +4,7 @@
 
 use crate::state::Shared;
 use bytes::Bytes;
-use h3wire::PeerSettings;
+use h3wire::{PeerSettings, StreamId};
 use std::future::poll_fn;
 use std::task::Poll;
 
@@ -27,6 +27,24 @@ impl Protocol {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+}
+
+/// One stream's buffers, from `ConnInfo::__debug_buffers`. Not public API.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct DebugStream {
+    /// The stream.
+    pub id: StreamId,
+    /// Raw bytes read but not fed to the core.
+    pub retained: usize,
+    /// Bytes in the send queue.
+    pub send_queued: usize,
+    /// Sizes of the queued send chunks, oldest first.
+    pub send_chunks: Vec<usize>,
+    /// Datagrams in the registered handle's queue.
+    pub dgram_queue: usize,
+    /// Pending (undecided) datagrams: count and bytes.
+    pub pending_dgrams: (usize, usize),
 }
 
 /// Connection information; `Clone`, and usable after the connection has closed.
@@ -72,6 +90,37 @@ impl ConnInfo {
         self.shared.with(|i| {
             let queued = i.streams.values().map(|s| s.dgram.queue.len()).sum();
             (queued, i.dgram.pending.len(), i.dgram.pending_bytes)
+        })
+    }
+
+    /// Per-stream buffers for the bound oracle, one entry per stream with any state, plus
+    /// the datagrams queued for the transport. Not public API.
+    #[doc(hidden)]
+    pub fn __debug_buffers(&self) -> (Vec<DebugStream>, usize) {
+        self.shared.with(|i| {
+            let mut ids: Vec<StreamId> =
+                i.streams.keys().chain(i.retained.keys()).copied().collect();
+            ids.extend(i.dgram.pending.iter().map(|(s, _)| *s));
+            ids.sort_by_key(|s| s.0);
+            ids.dedup();
+            let streams = ids
+                .into_iter()
+                .map(|id| {
+                    let st = i.streams.get(&id);
+                    let pending = i.dgram.pending.iter().filter(|(s, _)| *s == id);
+                    DebugStream {
+                        id,
+                        retained: i.retained.get(&id).map_or(0, |(b, _)| b.len()),
+                        send_queued: st.map_or(0, |s| s.send.queued),
+                        send_chunks: st.map_or(Vec::new(), |s| {
+                            s.send.queue.iter().map(Bytes::len).collect()
+                        }),
+                        dgram_queue: st.map_or(0, |s| s.dgram.queue.len()),
+                        pending_dgrams: pending.fold((0, 0), |(n, b), (_, d)| (n + 1, b + d.len())),
+                    }
+                })
+                .collect();
+            (streams, i.dgram.out.len())
         })
     }
 

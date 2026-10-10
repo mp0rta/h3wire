@@ -6,7 +6,7 @@ use crate::quic::{
     Connection, ReadError, RecvStream, SendDatagramError, SendStream, TransportError, WriteError,
     Written,
 };
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use h3wire::StreamId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -140,6 +140,7 @@ struct Net {
     loss: bool,
     reorder: bool,
     early_wake: bool,
+    coalesce: bool,
     trace: Vec<MockObs>,
     /// One-shot hooks run right after an accepted write by (side, stream).
     write_hooks: HashMap<(Side, StreamId), Box<dyn FnOnce() + Send>>,
@@ -261,6 +262,7 @@ impl MockNet {
             loss: false,
             reorder: false,
             early_wake: false,
+            coalesce: false,
             trace: Vec::new(),
             write_hooks: HashMap::new(),
         })));
@@ -338,6 +340,12 @@ impl MockNet {
     /// registered, as if readiness arrived before registration completed.
     pub fn readiness_before_register(&self, on: bool) {
         self.lock().early_wake = on;
+    }
+
+    /// Reads return up to `max_len` bytes across write boundaries (as quinn does), not
+    /// one written chunk at a time.
+    pub fn coalesce_reads(&self, on: bool) {
+        self.lock().coalesce = on;
     }
 
     /// Fail `side`'s transport; its operations (pending ones included) return
@@ -677,12 +685,24 @@ impl RecvStream for MockRecv {
             return Poll::Ready(Err(ReadError::Transport(dead_err(code))));
         }
         let writer = self.side.peer();
+        let coalesce = n.coalesce;
         let d = n.dir(self.id, writer);
         if d.stop.is_some() {
             return Poll::Ready(Err(ReadError::Closed));
         }
         if let Some(code) = d.reset {
             return Poll::Ready(Err(ReadError::Reset(code)));
+        }
+        if coalesce && d.buf.len() > 1 && d.buf[0].len() < max_len {
+            let mut v = BytesMut::new();
+            while let Some(f) = d.buf.front_mut().filter(|_| v.len() < max_len) {
+                let k = f.len().min(max_len - v.len());
+                v.extend_from_slice(&f.split_to(k));
+                if f.is_empty() {
+                    d.buf.pop_front();
+                }
+            }
+            return Poll::Ready(Ok(Some(v.freeze())));
         }
         if let Some(front) = d.buf.front_mut() {
             let chunk = if front.len() <= max_len {
