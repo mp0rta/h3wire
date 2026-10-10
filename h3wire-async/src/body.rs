@@ -128,8 +128,11 @@ impl Drop for RecvBody {
                     i.discard_body(id);
                     i.wake_driver();
                 } else if r.task_owned {
-                    // The per-request task commits the abort when it ends.
+                    // No reader remains: the queued bytes go (their budget with them);
+                    // the per-request task commits the abort when it ends.
                     r.abandoned = true;
+                    i.discard_body(id);
+                    i.wake_driver();
                 } else {
                     // Err: not a live request stream any more; nothing to abort.
                     let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);

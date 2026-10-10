@@ -10,10 +10,14 @@ use std::sync::Arc;
 /// A boxed, thread-safe error.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// An error from this crate; inspect it with [`Error::kind`].
+/// An error from this crate; inspect it with [`Error::kind`]. The underlying cause, if
+/// any, is its [`source`](std::error::Error::source): the QUIC error for
+/// [`ErrorKind::Transport`], the body's error for [`ErrorKind::Body`], the Service's
+/// `poll_ready` error for a server closed because of it.
 #[derive(Clone, Debug)]
 pub struct Error {
     kind: ErrorKind,
+    source: Option<Arc<BoxError>>,
 }
 
 /// What went wrong.
@@ -83,7 +87,15 @@ impl Error {
 
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
-        Error { kind }
+        Error { kind, source: None }
+    }
+}
+
+impl Error {
+    /// The same error, caused by `source`.
+    pub(crate) fn with_source(mut self, source: BoxError) -> Self {
+        self.source = Some(Arc::new(source));
+        self
     }
 }
 
@@ -100,13 +112,21 @@ impl fmt::Display for Error {
             ErrorKind::SendStopped { code } => write!(f, "peer stopped sending ({:#x})", code.0),
             ErrorKind::Usage(e) => e.fmt(f),
             ErrorKind::Transport(e) => e.fmt(f),
-            ErrorKind::Body(e) => write!(f, "body error: {e}"),
+            ErrorKind::Body(_) => f.write_str("body error"),
             ErrorKind::NotUpgraded => f.write_str("request was not upgraded"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            ErrorKind::Transport(e) => Some(&**e),
+            ErrorKind::Body(e) => Some(&***e),
+            _ => self.source.as_deref().map(|e| &**e as _),
+        }
+    }
+}
 
 /// Why a datagram operation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -91,12 +91,18 @@ impl StreamState {
         self.recv.eof || self.recv.error.is_some()
     }
 
-    /// The receive side is over for its reader too: an error, or the end with nothing
-    /// left to read. `Owns::Both` waits for this, so a Service still reading the tail of a
-    /// finished request is not cancelled.
+    /// The receive direction is terminal for `Owns::Both` (spec §4.6), when any of:
+    /// - the reader consumed the end: FIN arrived, the queue is drained, the trailers taken;
+    /// - no reader remains: its `RecvBody` was dropped (`abandoned`; the queue was
+    ///   discarded and later body bytes are not queued);
+    /// - the stream was reset, errored or aborted.
+    ///
+    /// So a Service still reading the tail of a finished request is not cancelled (it may
+    /// be cut at its next `Pending` after the last chunk), while one that dropped its body
+    /// and waits on something unrelated is.
     fn recv_consumed(&self) -> bool {
         let r = &self.recv;
-        r.error.is_some() || (r.eof && r.queue.is_empty() && r.trailers.is_none())
+        r.error.is_some() || r.abandoned || (r.eof && r.queue.is_empty() && r.trailers.is_none())
     }
 }
 
@@ -147,8 +153,8 @@ pub(crate) struct RecvState {
     pub waker: Option<Waker>,
     /// A consumer found the queue empty and has not been handed a frame since.
     pub consumer_waiting: bool,
-    /// Task 7: a live per-request task owns the body. Dropping it then only sets
-    /// `abandoned`; the task commits the abort when it ends.
+    /// Task 7: a live per-request task owns the body. Dropping it then discards the queue
+    /// and sets `abandoned`; the task commits the abort when it ends.
     pub task_owned: bool,
     pub abandoned: bool,
 }
@@ -344,8 +350,13 @@ impl Inner {
     }
 
     /// Queue a body slice of `id`; `demand` counts it against the stream's reservation.
+    /// Bytes of an abandoned body (no reader) are dropped.
     pub(crate) fn queue_body(&mut self, id: StreamId, b: Bytes, demand: bool) {
-        let Some(st) = self.streams.get_mut(&id).filter(|_| !b.is_empty()) else {
+        let Some(st) = self
+            .streams
+            .get_mut(&id)
+            .filter(|s| !b.is_empty() && !s.recv.abandoned)
+        else {
             return;
         };
         let r = &mut st.recv;

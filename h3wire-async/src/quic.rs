@@ -29,7 +29,11 @@ pub struct TransportError {
 
 impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "transport error: {}", self.source)
+        // The cause is `source()`, not repeated here.
+        match self.peer_app_code {
+            Some(code) => write!(f, "transport error (peer closed with {code:#x})"),
+            None => f.write_str("transport error"),
+        }
     }
 }
 

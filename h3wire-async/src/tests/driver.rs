@@ -313,3 +313,24 @@ fn once_slot_single_consumption_and_last_drop() {
     drop(b);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn error_source_not_repeated_in_display() {
+    use crate::quic::TransportError;
+    use std::error::Error as _;
+    let t: Error = ErrorKind::Transport(Arc::new(TransportError {
+        peer_app_code: Some(0x10c),
+        source: "link down".into(),
+    }))
+    .into();
+    assert_eq!(t.to_string(), "transport error (peer closed with 0x10c)");
+    let cause = t.source().expect("the TransportError");
+    assert_eq!(cause.source().expect("its cause").to_string(), "link down");
+    let b: Error = ErrorKind::Body(Arc::new("bad chunk".into())).into();
+    assert_eq!(b.to_string(), "body error");
+    assert_eq!(
+        b.source().expect("the body's error").to_string(),
+        "bad chunk"
+    );
+    assert!(Error::from(ErrorKind::NotUpgraded).source().is_none());
+}

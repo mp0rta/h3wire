@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
 use super::client::{drive, drive_until, has};
-use super::driver::{done, spawn};
+use super::driver::{done, spawn, take};
 use super::recv::{headers_frame, settle};
 use super::send::finished;
 use crate::__testing::exec::{TestExec, run};
 use crate::__testing::{Ack, CorePeer, MockConn, MockNet, MockObs, PeerObs, Side};
 use crate::body::RecvBody;
 use crate::builder::Builder;
-use crate::error::BoxError;
+use crate::error::{BoxError, ErrorKind};
 use crate::ext::ConnInfo;
 use crate::server::ServerConnection;
 use crate::state::Shared;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use h3wire::{AbortSource, Config, Event, H3Code, Role, StreamId};
 use http::{HeaderMap, Method, Request, Response};
 use http_body::{Body, Frame};
@@ -71,9 +71,12 @@ fn data(tx: &mpsc::UnboundedSender<Frm>, b: &[u8]) {
         .unwrap();
 }
 
-/// Closes `poll_ready` while shut.
+/// Closes `poll_ready` while shut; a stored error is returned once by `poll_ready`.
 #[derive(Clone, Default)]
-struct Gate(Arc<Mutex<(bool, Option<Waker>)>>);
+struct Gate(Arc<Mutex<GateState>>);
+
+/// Shut, the waiting waker, the error to fail with.
+type GateState = (bool, Option<Waker>, Option<BoxError>);
 
 impl Gate {
     fn shut(&self, shut: bool) {
@@ -99,6 +102,9 @@ impl<F: FnMut(Request<RecvBody>) -> Fut> Service<Request<RecvBody>> for Svc<F> {
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
         let mut g = self.gate.0.lock().unwrap();
+        if let Some(e) = g.2.take() {
+            return Poll::Ready(Err(e));
+        }
         if g.0 {
             g.1 = Some(cx.waker().clone());
             return Poll::Pending;
@@ -633,4 +639,74 @@ fn graceful_shutdown_holes_and_reordering() {
         drive(peer, conn).await.expect("a clean close");
     });
     assert_eq!(s.net.closed_with(Side::Server), Some(0x100));
+}
+
+/// No reader remains: a Service that dropped its unread body (with bytes queued) and then
+/// waits on something unrelated is cancelled once the response side ends too; the queued
+/// bytes are released at the drop and the entry is reaped.
+#[test]
+fn abandoned_body_then_unrelated_wait_is_cancelled() {
+    let alive = Arc::new(());
+    let a2 = alive.clone();
+    let (drop_tx, drop_rx) = oneshot::channel::<()>();
+    let drop_rx = Arc::new(Mutex::new(Some(drop_rx)));
+    let mut s = server(move |req: Request<RecvBody>| -> Fut {
+        let held = a2.clone();
+        let rx = drop_rx.lock().unwrap().take().unwrap();
+        Box::pin(async move {
+            let _held = held;
+            let body = req.into_body();
+            let _ = rx.await;
+            drop(body);
+            std::future::pending().await
+        })
+    });
+    let info = ConnInfo::new(s.shared.clone());
+    let _srv = spawn(&s.exec, s.conn);
+    run(&s.exec, async {
+        let a = open(&mut s.peer, &req("POST", "/"), false).await;
+        s.peer.send_body(a, b"abc", false);
+        s.peer
+            .run_until(|_| info.__debug_recv_accounting().0 == 3)
+            .await;
+        drop_tx.send(()).unwrap();
+        s.peer
+            .run_until(|_| info.__debug_recv_accounting() == (0, 0, 0))
+            .await;
+        assert_eq!(Arc::strong_count(&alive), 3, "still running");
+        s.peer.stop_sending(a, H3Code::REQUEST_CANCELLED);
+        s.peer.send_body(a, b"def", true);
+        s.peer.run_until(|_| Arc::strong_count(&alive) == 2).await;
+        s.peer
+            .run_until(|_| s.shared.with(|i| i.streams.is_empty()))
+            .await;
+    });
+    assert_eq!(info.__debug_recv_accounting(), (0, 0, 0));
+}
+
+/// `poll_ready` fails: the connection closes with `H3_INTERNAL_ERROR`, and the output
+/// carries the Service's error as its source.
+#[test]
+fn poll_ready_error_closes_internal_error() {
+    let mut s = server(|_| -> Fut { Box::pin(async { respond(200, ChanBody::of(&[])) }) });
+    s.gate.0.lock().unwrap().2 = Some(Box::new(std::io::Error::other("not ready")));
+    let srv = spawn(&s.exec, s.conn);
+    run(&s.exec, async {
+        s.peer.run_until(|_| done(&srv)).await;
+    });
+    let e = take(&srv).unwrap_err();
+    assert!(
+        matches!(
+            e.kind(),
+            ErrorKind::Closed {
+                code: H3Code::INTERNAL_ERROR,
+                by_peer: false
+            }
+        ),
+        "{e:?}"
+    );
+    let src = std::error::Error::source(&e).expect("the Service's error");
+    let io = src.downcast_ref::<std::io::Error>().expect("its type");
+    assert_eq!(io.to_string(), "not ready");
+    assert_eq!(s.net.closed_with(Side::Server), Some(0x102));
 }

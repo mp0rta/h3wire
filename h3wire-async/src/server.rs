@@ -48,6 +48,7 @@ impl Builder {
             service,
             exec,
             shutdown: false,
+            service_error: None,
         }
     }
 }
@@ -63,12 +64,17 @@ impl Builder {
 ///   `H3_INTERNAL_ERROR`. `100 Continue` is sent when a request carrying
 ///   `expect: 100-continue` has its body polled before any response.
 /// - It resolves `Ok` on a clean close (graceful shutdown, or the peer closing with
-///   `H3_NO_ERROR`). Dropping it closes the connection with `H3_NO_ERROR`.
+///   `H3_NO_ERROR`). Dropping it closes the connection with `H3_NO_ERROR`. If
+///   `poll_ready` fails, the connection closes with `H3_INTERNAL_ERROR` and it resolves
+///   `Err` (`Closed { code: INTERNAL_ERROR, by_peer: false }`) whose `source()` is the
+///   Service's error.
 pub struct ServerConnection<C: quic::Connection, S, E> {
     pub(crate) driver: Driver<C>,
     service: S,
     exec: E,
     shutdown: bool,
+    /// The `poll_ready` error the connection was closed for: the output's `source()`.
+    service_error: Option<BoxError>,
 }
 
 // No field is structurally pinned.
@@ -128,7 +134,8 @@ where
             assert_unlocked();
             match self.service.poll_ready(cx) {
                 Poll::Pending => return Some(false),
-                Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(e)) => {
+                    self.service_error = Some(e.into());
                     self.driver.close(H3Code::INTERNAL_ERROR);
                     return None;
                 }
@@ -339,16 +346,24 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        let Some(ready) = this.dispatch(cx) else {
-            return Pin::new(&mut this.driver).poll(cx);
+        let r = match this.dispatch(cx) {
+            None => Pin::new(&mut this.driver).poll(cx),
+            Some(ready) => {
+                // During shutdown acceptance never stops: the core rejects late requests.
+                this.driver.accept_bidi = ready || this.shutdown;
+                let r = Pin::new(&mut this.driver).poll(cx);
+                // Requests this pass delivered; releasing their heads wakes the driver.
+                if r.is_pending() && this.dispatch(cx).is_none() {
+                    Pin::new(&mut this.driver).poll(cx)
+                } else {
+                    r
+                }
+            }
         };
-        // During shutdown acceptance never stops: the core rejects late requests.
-        this.driver.accept_bidi = ready || this.shutdown;
-        let r = Pin::new(&mut this.driver).poll(cx);
-        // Requests this pass delivered; releasing their heads wakes the driver.
-        if r.is_pending() && this.dispatch(cx).is_none() {
-            return Pin::new(&mut this.driver).poll(cx);
-        }
-        r
+        // A close caused by `poll_ready` carries the Service's error as its source.
+        r.map_err(|e| match this.service_error.take() {
+            Some(s) => e.with_source(s),
+            None => e,
+        })
     }
 }
