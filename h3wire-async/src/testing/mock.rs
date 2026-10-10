@@ -141,6 +141,7 @@ struct Net {
     reorder: bool,
     early_wake: bool,
     coalesce: bool,
+    readable_after_close: bool,
     trace: Vec<MockObs>,
     /// One-shot hooks run right after an accepted write by (side, stream).
     write_hooks: HashMap<(Side, StreamId), Box<dyn FnOnce() + Send>>,
@@ -271,6 +272,7 @@ impl MockNet {
             reorder: false,
             early_wake: false,
             coalesce: false,
+            readable_after_close: false,
             trace: Vec::new(),
             write_hooks: HashMap::new(),
         })));
@@ -387,6 +389,13 @@ impl MockNet {
         }
         n.sides[side.idx()].dead = Some(d);
         n.wake_all();
+    }
+
+    /// After the transport died, reads still return what was already received (data,
+    /// then FIN or a reset) and fail only once nothing is left, as quinn does. Off: they
+    /// fail at once.
+    pub fn readable_after_close(&self, on: bool) {
+        self.lock().readable_after_close = on;
     }
 
     /// The stream credit the peer grants `side` for bidirectional streams.
@@ -714,7 +723,8 @@ impl RecvStream for MockRecv {
         max_len: usize,
     ) -> Poll<Result<Option<Bytes>, ReadError>> {
         let mut n = self.net.lock();
-        if let Some(code) = n.sides[self.side.idx()].dead {
+        let dead = n.sides[self.side.idx()].dead;
+        if let Some(code) = dead.filter(|_| !n.readable_after_close) {
             return Poll::Ready(Err(ReadError::Transport(dead_err(code))));
         }
         let writer = self.side.peer();
@@ -750,6 +760,9 @@ impl RecvStream for MockRecv {
             wake(&mut d.stopped_w);
             n.touch(self.id);
             return Poll::Ready(Ok(None));
+        }
+        if let Some(code) = dead {
+            return Poll::Ready(Err(ReadError::Transport(dead_err(code))));
         }
         register(&mut d.read_w, cx);
         n.pending(cx)

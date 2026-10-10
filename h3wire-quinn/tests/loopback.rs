@@ -657,3 +657,52 @@ async fn shutdown_skips_unused_hole() {
     })
     .await
 }
+
+/// Poll `f` and the client connection `drv` together until `f` completes.
+async fn with_driver<D: Future + Unpin, F: Future>(drv: &mut D, f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    std::future::poll_fn(|cx| {
+        let _ = std::pin::Pin::new(&mut *drv).poll(cx);
+        f.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// The server's graceful close reaches the client's transport before the client driver
+/// read the response the transport had already acknowledged: quinn still holds it, and
+/// it is delivered whole before the close.
+#[tokio::test(flavor = "multi_thread")]
+async fn response_acked_before_close_is_delivered() {
+    with_timeout(async {
+        let conns = connect().await;
+        let (svc, mut reqs) = handoff();
+        let mut server = spawn_server(conns.server.clone(), &Builder::new(), svc);
+        let (mut send, mut drv) = h3wire_quinn::client::<BoxBody, _>(
+            conns.client.clone(),
+            &Builder::new(),
+            TokioExecutor,
+        )
+        .await
+        .unwrap();
+        let resp = send.send_request(get("/a"));
+        // Client driven until the server has read the whole request.
+        let (req, tx) = with_driver(&mut drv, reqs.recv()).await.unwrap();
+        with_driver(&mut drv, collect(req.into_body()))
+            .await
+            .unwrap();
+        // From here the client driver is not polled until the connection is closed.
+        tx.send(reply(200, full("done"))).unwrap();
+        server.shutdown().await;
+        server.done.await.unwrap().expect("server: a clean close");
+        let closed = conns.client.closed().await;
+        assert!(
+            matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+            "{closed:?}"
+        );
+        let r = with_driver(&mut drv, resp).await.expect("the response");
+        assert_eq!(r.status(), 200);
+        assert_eq!(collect(r.into_body()).await.unwrap().0, "done");
+        drv.await.expect("client: a clean close");
+    })
+    .await;
+}

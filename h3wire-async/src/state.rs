@@ -11,7 +11,7 @@ use crate::http_map::Fields;
 use crate::quic::TransportError;
 use crate::rt::{CancelToken, Owns};
 use bytes::Bytes;
-use h3wire::{AbortSource, Connection, H3Code, HeaderBlockId, StreamId};
+use h3wire::{AbortSource, Connection, H3Code, HeaderBlockId, StreamId, UsageError};
 use http::HeaderMap;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -49,6 +49,9 @@ impl CloseCause {
 }
 
 /// Per-stream protocol state. The QUIC objects live in the driver.
+/// A response head read out of the core: `conn.headers` mapped by `response_from_block`.
+pub(crate) type DecodedHead = Result<Result<http::Response<()>, H3Code>, UsageError>;
+
 #[derive(Debug)]
 pub(crate) struct StreamState {
     /// Header discovery is running: the request (server) or final response (client)
@@ -57,6 +60,9 @@ pub(crate) struct StreamState {
     /// The delivered request/response head, held until the application takes it. Whoever
     /// releases it must `mark_ready(id, Dir::Recv)`: a stream paused on it feeds again.
     pub head: Option<HeaderBlockId>,
+    /// Client: the final response head, decoded when the transport failed before it was
+    /// taken (the core drops its blocks on the close).
+    pub decoded_head: Option<DecodedHead>,
     pub recv: RecvState,
     pub send: SendState,
     /// Executor tasks owning directions of this stream (spec §4.6).
@@ -108,6 +114,7 @@ impl StreamState {
         StreamState {
             discovering: true,
             head: None,
+            decoded_head: None,
             recv: RecvState::default(),
             send: SendState::default(),
             cancels: Vec::new(),

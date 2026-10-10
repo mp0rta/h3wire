@@ -511,6 +511,7 @@ impl<C: quic::Connection> Future for Driver<C> {
             let moved = match this.round(cx, &mut budget) {
                 Ok(m) => m,
                 Err(e) => {
+                    this.drain_after_loss();
                     this.transport_failed(e);
                     true
                 }

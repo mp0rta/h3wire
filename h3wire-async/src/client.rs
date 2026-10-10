@@ -333,10 +333,17 @@ fn response(
     let Some(st) = i.streams.get_mut(&id) else {
         return Poll::Ready(Err(close.expect("streams outlive the connection")));
     };
-    if let Some(b) = st.head.take() {
-        let r = i.conn.headers(b).map(|h| response_from_block(&h));
-        i.conn.release(b);
-        i.mark_ready(id, Dir::Recv); // a stream paused on its next HEADERS feeds again
+    let head = match (st.decoded_head.take(), st.head.take()) {
+        (Some(r), _) => Some(r),
+        (None, Some(b)) => {
+            let r = i.conn.headers(b).map(|h| response_from_block(&h));
+            i.conn.release(b);
+            i.mark_ready(id, Dir::Recv); // a stream paused on its next HEADERS feeds again
+            Some(r)
+        }
+        (None, None) => None,
+    };
+    if let Some(r) = head {
         return Poll::Ready(match r {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(code)) => {
@@ -352,6 +359,9 @@ fn response(
             Err(e) => Err(close.unwrap_or_else(|| usage(e))),
         });
     }
+    let Some(st) = i.streams.get_mut(&id) else {
+        return Poll::Ready(Err(close.expect("streams outlive the connection")));
+    };
     if let Some(e) = st.recv.error.take() {
         st.recv.eof = true;
         return Poll::Ready(Err(e));
@@ -361,6 +371,19 @@ fn response(
     }
     st.recv.waker = Some(cx.waker().clone());
     Poll::Pending
+}
+
+/// The transport failed: decode the held response head of `id` now, before the core
+/// drops its blocks, and release it so the core decodes the trailers behind it.
+pub(crate) fn decode_head(i: &mut Inner, id: StreamId) {
+    let Some(b) = i.streams.get_mut(&id).and_then(|s| s.head.take()) else {
+        return;
+    };
+    let r = i.conn.headers(b).map(|h| response_from_block(&h));
+    i.conn.release(b);
+    if let Some(st) = i.streams.get_mut(&id) {
+        st.decoded_head = Some(r);
+    }
 }
 
 impl Drop for InFlight {
@@ -396,7 +419,8 @@ impl Drop for InFlight {
 
 /// The client connection's driver: a future to spawn on the executor. It resolves `Ok`
 /// on a clean close (graceful shutdown, or the peer closing with `H3_NO_ERROR` or with
-/// the transport's `NO_ERROR`). Dropping it closes the connection with `H3_NO_ERROR`.
+/// the transport's `NO_ERROR`). When the transport fails, responses it already holds are
+/// delivered before the close. Dropping it closes the connection with `H3_NO_ERROR`.
 pub struct ClientConnection<C: quic::Connection> {
     driver: Driver<C>,
 }

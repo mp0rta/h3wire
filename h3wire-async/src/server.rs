@@ -67,7 +67,8 @@ impl Builder {
 ///   `H3_INTERNAL_ERROR`. `100 Continue` is sent when a request carrying
 ///   `expect: 100-continue` has its body polled before any response.
 /// - It resolves `Ok` on a clean close (graceful shutdown, or the peer closing with
-///   `H3_NO_ERROR` or with the transport's `NO_ERROR`). Dropping it closes the connection with `H3_NO_ERROR`. If
+///   `H3_NO_ERROR` or with the transport's `NO_ERROR`). Data the transport already
+///   holds when it fails is delivered first. Dropping it closes the connection with `H3_NO_ERROR`. If
 ///   `poll_ready` fails, the connection closes with `H3_INTERNAL_ERROR` and it resolves
 ///   `Err` (`Closed { code: INTERNAL_ERROR, by_peer: false }`) whose `source()` is the
 ///   Service's error.

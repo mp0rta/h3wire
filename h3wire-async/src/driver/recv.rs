@@ -12,11 +12,12 @@
 //! retained bytes the transport is not read.
 
 use super::{Driver, dispatch_events};
+use crate::client::decode_head;
 use crate::quic::{self, ReadError, RecvStream, TransportError};
 use crate::state::{Dir, Inner};
 use bytes::Bytes;
-use h3wire::{H3Code, Recv, StreamId};
-use std::task::{Context, Poll};
+use h3wire::{H3Code, Recv, Role, StreamId};
+use std::task::{Context, Poll, Waker};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tier {
@@ -103,6 +104,57 @@ impl<C: quic::Connection> Driver<C> {
             Err(ReadError::Transport(e)) => return Err(e),
         }
         Ok(true)
+    }
+
+    /// The transport failed. Before the handles fail, feed the core what the transport
+    /// still holds on each request stream: a peer may close right after its last bytes
+    /// were acknowledged, and quinn still returns them. Each stream is read until a read
+    /// would block or fails, without the read-ahead limits: the bytes are in memory
+    /// already. Client response heads are decoded on the way (the core drops its blocks
+    /// on the close), which also lets the trailers behind them decode.
+    pub(super) fn drain_after_loss(&mut self) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let client = self.role == Role::Client;
+        let ids: Vec<StreamId> = self.shared.with(|i| i.streams.keys().copied().collect());
+        for id in ids {
+            loop {
+                if client {
+                    self.shared.with(|i| decode_head(i, id));
+                }
+                let (chunk, fin) = match self.shared.with(|i| i.retained.remove(&id)) {
+                    Some(r) => r,
+                    None => {
+                        let Some(r) = self.recvs.get_mut(&id) else {
+                            break;
+                        };
+                        match r.poll_read_chunk(&mut cx, usize::MAX) {
+                            Poll::Ready(Ok(Some(c))) => (c, false),
+                            Poll::Ready(Ok(None)) => {
+                                self.recvs.remove(&id);
+                                (Bytes::new(), true)
+                            }
+                            Poll::Ready(Err(ReadError::Reset(code))) => {
+                                self.recvs.remove(&id);
+                                // An Err is a state notification only.
+                                let _ = self
+                                    .shared
+                                    .with(|i| i.conn.stream_reset_received(id, H3Code(code)));
+                                break;
+                            }
+                            // Nothing more held, or the stream is over.
+                            _ => break,
+                        }
+                    }
+                };
+                if let Some(off) = self.feed(id, &chunk, fin, Tier::Speculative) {
+                    self.shared
+                        .with(|i| i.retained.insert(id, (chunk.slice(off..), fin)));
+                    if off == 0 {
+                        break; // paused on a head nobody can take now
+                    }
+                }
+            }
+        }
     }
 
     /// The tier and `max_len` for the next read of request stream `id`, if any. Starting

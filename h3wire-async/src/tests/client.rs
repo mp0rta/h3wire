@@ -610,3 +610,51 @@ fn peer_transport_error_close_is_not_clean() {
         "{k:?}"
     );
 }
+
+/// The peer sends whole responses and closes before the client driver read them; the
+/// transport still holds the bytes (as quinn does). They are delivered before the
+/// close fails the handles: the head, the body, the trailers (decoded only once the
+/// head is) and FIN; an unfinished response gets its data, then the close.
+#[test]
+fn data_held_by_transport_at_peer_close_is_delivered() {
+    let (net, mut send, mut conn, mut peer, exec) =
+        client::<String>(&Builder::new(), Config::default());
+    net.readable_after_close(true);
+    run(&exec, async {
+        let mut a = Box::pin(send.send_request(get("https://a/a")));
+        let mut b = Box::pin(send.send_request(get("https://a/b")));
+        drive_until(&mut peer, &mut conn, |p| finished(p, S0) && finished(p, S4)).await;
+        peer.send_headers(S0, &[(":status", "200")], false).unwrap();
+        peer.send_body(S0, b"done", false);
+        settle(&mut peer).await; // the body goes out before the trailers
+        peer.send_headers(S0, &[("x-check", "ok")], true).unwrap();
+        peer.send_headers(S4, &[(":status", "200")], false).unwrap();
+        peer.send_body(S4, b"par", false);
+        settle(&mut peer).await; // the client driver is not polled meanwhile
+        net.kill_transport(Side::Client, Some(0x100));
+        let (ra, rb) = poll_fn(|cx| {
+            let _ = Pin::new(&mut conn).poll(cx);
+            match (a.as_mut().poll(cx), b.as_mut().poll(cx)) {
+                (Poll::Ready(a), Poll::Ready(b)) => Poll::Ready((a, b)),
+                _ => Poll::Pending,
+            }
+        })
+        .await;
+        let (body, trailers) = collect(&mut peer, ra.expect("a's response").body_mut()).await;
+        assert_eq!(body, b"done");
+        assert_eq!(trailers.expect("trailers")["x-check"], "ok");
+        let mut rb = rb.expect("b's response").into_body();
+        assert_eq!(
+            next_frame(&mut peer, &mut rb)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap(),
+            "par"
+        );
+        let e = next_frame(&mut peer, &mut rb).await.unwrap().unwrap_err();
+        assert!(matches!(e.kind(), ErrorKind::Transport(_)), "{e:?}");
+        conn.await.expect("the peer closed with H3_NO_ERROR");
+    });
+}
