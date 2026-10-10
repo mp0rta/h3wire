@@ -303,8 +303,10 @@ impl MockNet {
     pub fn ack_all(&self) {
         let mut n = self.lock();
         for d in n.dirs.values_mut() {
-            d.acked = true;
-            wake(&mut d.stopped_w);
+            if d.fin && d.eof_read {
+                d.acked = true;
+                wake(&mut d.stopped_w);
+            }
         }
     }
 
@@ -333,6 +335,9 @@ impl MockNet {
     /// `TransportError { peer_app_code, .. }`.
     pub fn kill_transport(&self, side: Side, peer_app_code: Option<u64>) {
         let mut n = self.lock();
+        if n.sides[side.idx()].dead.is_some() {
+            return; // first failure wins, as with a real connection
+        }
         n.sides[side.idx()].dead = Some(peer_app_code);
         n.wake_all();
     }
@@ -514,6 +519,9 @@ impl Connection for MockConn {
 
     fn close(&mut self, code: u64) {
         let mut n = self.net.lock();
+        if n.sides[self.side.idx()].dead.is_some() {
+            return; // closing a closed connection is a no-op
+        }
         n.trace.push(MockObs::Close {
             side: self.side,
             code,
@@ -555,7 +563,11 @@ impl SendStream for MockSend {
         let mut room = max_write.unwrap_or(usize::MAX);
         let (mut bytes, mut chunks) = (0, 0);
         for b in bufs.iter_mut() {
-            if b.len() <= room {
+            if b.is_empty() {
+                chunks += 1; // like quinn: an empty chunk is trivially written
+            } else if room == 0 {
+                break;
+            } else if b.len() <= room {
                 room -= b.len();
                 bytes += b.len();
                 chunks += 1;
@@ -566,6 +578,10 @@ impl SendStream for MockSend {
                 bytes += room;
                 break;
             }
+        }
+        if bytes == 0 && bufs.iter().any(|b| !b.is_empty()) {
+            register(&mut d.write_w, cx);
+            return n.pending(cx);
         }
         wake(&mut d.read_w);
         n.trace.push(MockObs::Write {

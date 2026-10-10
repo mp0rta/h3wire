@@ -113,6 +113,7 @@ fn mock_stopped_and_manual_ack() {
     let (net, mut c, mut s) = MockNet::pair();
     net.ack_mode(Ack::Manual);
     let ((mut cs, _), (_, mut sr)) = bidi(&mut c, &mut s);
+    net.ack_all(); // too early: must not pre-ack
     cs.finish();
     assert!(poll(|cx| cs.poll_stopped(cx)).is_pending());
     assert!(ready(|cx| sr.poll_read_chunk(cx, 8)).unwrap().is_none());
@@ -240,4 +241,50 @@ fn test_exec_drops_panicking_task() {
         }));
     }));
     assert_eq!(run(&exec, async { rx.await.unwrap() }), 7);
+}
+
+#[test]
+fn mock_close_first_wins() {
+    let (net, mut c, mut s) = MockNet::pair();
+    s.close(0x1);
+    c.close(0x2);
+    net.kill_transport(Side::Server, Some(0x3));
+    assert_eq!(net.closed_with(Side::Server), Some(0x1));
+    assert_eq!(net.closed_with(Side::Client), None);
+    assert_eq!(net.trace().len(), 1);
+    assert_eq!(
+        ready(|cx| c.poll_accept_uni(cx)).unwrap_err().peer_app_code,
+        Some(0x1)
+    );
+    assert_eq!(
+        ready(|cx| s.poll_accept_uni(cx)).unwrap_err().peer_app_code,
+        None
+    );
+}
+
+#[test]
+fn mock_write_never_yields_empty_chunks() {
+    let (net, mut c, mut s) = MockNet::pair();
+    let ((mut cs, _), (_, mut sr)) = bidi(&mut c, &mut s);
+    net.max_write(Some(3));
+    let mut bufs = [b("abc"), b(""), b("def")];
+    let w = ready(|cx| cs.poll_write_chunks(cx, &mut bufs)).unwrap();
+    assert_eq!(
+        w,
+        Written {
+            bytes: 3,
+            chunks: 2
+        }
+    );
+    assert_eq!(
+        ready(|cx| sr.poll_read_chunk(cx, 16)).unwrap().unwrap(),
+        "abc"
+    );
+    assert!(poll(|cx| sr.poll_read_chunk(cx, 16)).is_pending());
+    // Zero capacity pends (like quinn) instead of returning Written{0,0}.
+    net.max_write(Some(0));
+    assert!(poll(|cx| cs.poll_write_chunks(cx, &mut bufs)).is_pending());
+    net.max_write(None);
+    let w = ready(|cx| cs.poll_write_chunks(cx, &mut bufs)).unwrap();
+    assert_eq!(w.bytes, 6);
 }
