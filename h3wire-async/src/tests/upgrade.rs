@@ -605,3 +605,60 @@ fn tunnel_send_cancel_safety() {
         assert_eq!(out(&all).await, b"aaaabbbbbbbbdd");
     });
 }
+
+/// After the peer's FIN was read the core emits no `StreamAborted` for a local abort; the
+/// send side still ends at once with `StreamAborted { code, Local }`.
+#[test]
+fn abort_after_recv_eof_ends_send_side() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    let msg = H3Code::MESSAGE_ERROR;
+    run(&exec, async {
+        let (mut c, mut s) = tunnels(&mut p).await;
+        c.finish().unwrap();
+        assert_eq!(read_to_end(&mut s).await, b"");
+        s.abort(msg);
+        let e = s.send(Bytes::from_static(b"x")).await.expect_err("aborted");
+        assert!(is_aborted(&e, msg, AbortSource::Local), "{e:?}");
+        assert!(s.finish().is_err());
+        until(|| reset_by(&p.net, Side::Server, S0).is_some()).await;
+        drop((c, s));
+        quiesce().await;
+    });
+    assert_eq!(reset_by(&p.net, Side::Server, S0), Some(msg.0));
+}
+
+/// A claimed CONNECT whose request already ended (FIN), then the Service fails: the
+/// `OnUpgrade` resolves with the abort, and the entry is reaped.
+#[test]
+fn claimed_request_ended_then_service_fails() {
+    let (net, c, s) = MockNet::pair();
+    let exec = TestExec::default();
+    let (tx, mut reqs) = mpsc::unbounded();
+    let srv = Builder::new().serve_connection(s, Handoff(tx), exec.clone());
+    let shared = srv.driver.shared();
+    spawn(&exec, srv);
+    let mut peer = CorePeer::new(Role::Client, Config::default(), c);
+    run(&exec, async {
+        let s = peer.open_bidi().await.unwrap();
+        let fields = [(":method", "CONNECT"), (":authority", "a:443")];
+        peer.send_headers(s, &fields, true).unwrap();
+        let (mut req, tx) = drive(&mut peer, &mut reqs.next()).await.unwrap();
+        let mut on = upgrade::on(&mut req);
+        drop(req);
+        peer.run_until(|_| shared.with(|i| i.streams[&s].recv.eof))
+            .await;
+        drop(tx); // the Service fails: no response
+        let e = drive(&mut peer, &mut on).await.expect_err("no tunnel");
+        assert!(
+            is_aborted(&e, H3Code::INTERNAL_ERROR, AbortSource::Local),
+            "{e:?}"
+        );
+        peer.run_until(|_| shared.with(|i| i.streams.is_empty()))
+            .await;
+    });
+    assert_eq!(
+        reset_by(&net, Side::Server, S0),
+        Some(H3Code::INTERNAL_ERROR.0)
+    );
+}

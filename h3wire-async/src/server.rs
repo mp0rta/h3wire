@@ -14,7 +14,7 @@ use crate::slot::OnceSlot;
 use crate::state::{Dir, Inner, Shared, assert_unlocked};
 use crate::upgrade::{Claim, UpgradeCell, settle};
 use bytes::Buf;
-use h3wire::{H3Code, Role, StreamId, UsageError};
+use h3wire::{AbortSource, H3Code, Role, StreamId, UsageError};
 use http::header::EXPECT;
 use http::{Method, Request, Response, StatusCode};
 use http_body::Body;
@@ -186,8 +186,7 @@ fn next_request(i: &mut Inner) -> Option<(StreamId, Request<()>, CancelToken)> {
         let req = match r {
             Ok(Ok(req)) => req,
             Ok(Err(code)) => {
-                // Err: the stream or connection is already over.
-                let _ = i.conn.abort(id, code);
+                i.abort_local(id, code);
                 continue;
             }
             // The core dropped its blocks: the connection closed.
@@ -337,17 +336,26 @@ impl Commit {
                 return;
             };
             st.recv.task_owned = false;
-            let code = if st.task_failed || !st.final_sent {
+            let no_response = !st.final_sent;
+            let code = if st.task_failed || no_response {
                 Some(H3Code::INTERNAL_ERROR)
             } else if st.recv.abandoned && !st.recv_terminal() {
                 Some(H3Code::REQUEST_CANCELLED)
             } else {
                 None
             };
+            if no_response {
+                // A claim's `OnUpgrade` learns of it even when the core emits no event
+                // (the request had ended).
+                let e = ErrorKind::StreamAborted {
+                    code: H3Code::INTERNAL_ERROR,
+                    source: AbortSource::Local,
+                    retryable: false,
+                };
+                settle(i, id, Err(e.into()));
+            }
             if let Some(code) = code {
-                // Err: the stream or connection is already over.
-                let _ = i.conn.abort(id, code);
-                i.wake_driver();
+                i.abort_local(id, code);
             }
             i.release_user(id);
         });

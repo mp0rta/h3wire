@@ -229,7 +229,7 @@ fn next_write(i: &mut Inner, id: StreamId, frame: Option<Vec<Bytes>>) -> Next {
             // no-content response): a body error.
             // (`Blocked` cannot happen: core bytes were drained above.)
             Err(_) => {
-                let _ = i.conn.abort(id, H3Code::INTERNAL_ERROR);
+                i.abort_local(id, H3Code::INTERNAL_ERROR);
                 return Next::Idle(true);
             }
         }

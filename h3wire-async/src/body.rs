@@ -213,9 +213,7 @@ where
     let task = async move {
         if pipe_body(&shared, id, body).await.is_err() {
             shared.with(|i| {
-                // Err: the stream or connection is already over.
-                let _ = i.conn.abort(id, H3Code::INTERNAL_ERROR);
-                i.wake_driver();
+                i.abort_local(id, H3Code::INTERNAL_ERROR);
             });
         }
     };

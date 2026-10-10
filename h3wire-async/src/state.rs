@@ -10,7 +10,7 @@ use crate::http_map::Fields;
 use crate::quic::TransportError;
 use crate::rt::{CancelToken, Owns};
 use bytes::Bytes;
-use h3wire::{Connection, H3Code, HeaderBlockId, StreamId};
+use h3wire::{AbortSource, Connection, H3Code, HeaderBlockId, StreamId};
 use http::HeaderMap;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -86,7 +86,7 @@ pub(crate) enum Up {
     Claimed,
     /// A 2xx went out (server) or came in (client): the tunnel can be taken.
     Active,
-    /// The tunnel was taken.
+    /// The tunnel was taken; kept until the entry is reaped.
     Tunnel,
     /// Server: the final response settled a claim without a tunnel; its `OnUpgrade`
     /// resolves to this.
@@ -375,6 +375,45 @@ impl Inner {
         self.fire_cancels(id);
     }
 
+    /// Abort `id` locally with `code` in both directions (a no-op once it is over) and
+    /// record it in the per-stream state at once. The core emits `StreamAborted` only if
+    /// the stream had no terminal event yet; after `Finished` (the peer's FIN was read) it
+    /// emits nothing, so a send side still open is ended here with
+    /// `StreamAborted { code, Local }` (and likewise a receive side not ended yet).
+    /// Wakes the driver for the core's actions.
+    pub(crate) fn abort_local(&mut self, id: StreamId, code: H3Code) {
+        // Err: the connection is closed, the stream unknown or the code refused.
+        if self.conn.abort(id, code).is_err() {
+            return;
+        }
+        crate::driver::dispatch_events(self);
+        self.wake_driver();
+        let Some(st) = self.streams.get_mut(&id) else {
+            return;
+        };
+        let e: Error = ErrorKind::StreamAborted {
+            code,
+            source: AbortSource::Local,
+            retryable: false,
+        }
+        .into();
+        let (recv, send) = (!st.recv_terminal(), !st.send.done);
+        if recv {
+            st.recv.trailers = None;
+            st.recv.error = Some(e.clone());
+            self.pending_wakers.extend(st.recv.waker.take());
+            self.discard_body(id);
+        }
+        if send {
+            if let Some(st) = self.streams.get_mut(&id) {
+                st.send.error = Some(e);
+            }
+            self.send_terminal(id);
+        } else if recv {
+            self.fire_cancels(id);
+        }
+    }
+
     /// The reader of `id`'s receive side (a `RecvBody`, a claim or a `TunnelRecv`) is
     /// gone before reading to the end. If the direction ended (FIN, error, close) what is
     /// left goes and it counts as consumed. Otherwise the stream is aborted with
@@ -395,8 +434,7 @@ impl Inner {
             r.abandoned = true;
             self.discard_body(id);
         } else {
-            // Err: not a live request stream any more; nothing to abort.
-            let _ = self.conn.abort(id, H3Code::REQUEST_CANCELLED);
+            self.abort_local(id, H3Code::REQUEST_CANCELLED);
         }
         self.wake_driver();
     }

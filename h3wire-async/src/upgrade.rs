@@ -20,7 +20,6 @@
 //! direction already ended does nothing. A [`Tunnel`] is both halves.
 
 use crate::body::RecvBody;
-use crate::driver::dispatch_events;
 use crate::error::{Error, ErrorKind};
 use crate::slot::OnceSlot;
 use crate::state::{Dir, End, Inner, Shared, Up};
@@ -49,15 +48,18 @@ impl Drop for Claim {
     fn drop(&mut self) {
         let id = self.id;
         self.shared.with(|i| {
+            // `Tunnel` and `Failed` stay observable.
             if let Some(st) = i.streams.get_mut(&id) {
-                match std::mem::take(&mut st.up) {
+                match st.up {
                     // Released before the final response: no reader remains.
-                    Up::Claimed => i.drop_reader(id),
+                    Up::Claimed => {
+                        st.up = Up::None;
+                        i.drop_reader(id);
+                    }
                     // Activated, but the tunnel was never taken.
                     Up::Active => {
-                        // Err: the stream or connection is already over.
-                        let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);
-                        i.wake_driver();
+                        st.up = Up::None;
+                        i.abort_local(id, H3Code::REQUEST_CANCELLED);
                     }
                     _ => {}
                 }
@@ -192,26 +194,20 @@ fn poll_claim(i: &mut Inner, id: StreamId, cx: &mut Context<'_>) -> Poll<Result<
 }
 
 /// Server: the final response of a CONNECT went out (`Ok`: a 2xx), or will not (`Err`:
-/// what its `OnUpgrade` resolves to). A 2xx nobody holds the claim for is aborted with
-/// `H3_REQUEST_CANCELLED`.
+/// what its `OnUpgrade` resolves to). Only a claim still waiting is settled, so the first
+/// outcome wins. A 2xx nobody holds the claim for is aborted with `H3_REQUEST_CANCELLED`.
 pub(crate) fn settle(i: &mut Inner, id: StreamId, sent: Result<(), Error>) {
     let Some(st) = i.streams.get_mut(&id) else {
         return;
     };
-    let claimed = matches!(st.up, Up::Claimed);
-    if claimed {
+    if matches!(st.up, Up::Claimed) {
         i.pending_wakers.extend(st.recv.waker.take());
-    }
-    let unclaimed_2xx = !claimed && sent.is_ok();
-    st.up = match sent {
-        Ok(()) if claimed => Up::Active,
-        Err(e) if claimed => Up::Failed(e),
-        _ => Up::None,
-    };
-    if unclaimed_2xx {
-        // Err: the stream or connection is already over.
-        let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);
-        i.wake_driver();
+        st.up = match sent {
+            Ok(()) => Up::Active,
+            Err(e) => Up::Failed(e),
+        };
+    } else if sent.is_ok() {
+        i.abort_local(id, H3Code::REQUEST_CANCELLED);
     }
 }
 
@@ -268,16 +264,10 @@ impl Tunnel {
     }
 }
 
-/// Abort the whole request with `code`; idempotent. The core's event is dispatched at
-/// once, so the other half sees `StreamAborted { code, source: Local }` immediately.
+/// Abort the whole request with `code`; idempotent. It is recorded at once, so the other
+/// half sees `StreamAborted { code, source: Local }` immediately.
 fn abort(shared: &Shared, id: StreamId, code: H3Code) {
-    shared.with(|i| {
-        // Err: already over, or an invalid code.
-        if i.conn.abort(id, code).is_ok() {
-            dispatch_events(i);
-        }
-        i.wake_driver();
-    });
+    shared.with(|i| i.abort_local(id, code));
 }
 
 /// The sending half of a [`Tunnel`].
@@ -365,9 +355,7 @@ impl Drop for TunnelSend {
         let (id, finished) = (self.id, self.finished);
         self.shared.with(|i| {
             if send_refused(i, id, finished).is_none() {
-                // Err: the stream or connection is already over.
-                let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);
-                i.wake_driver();
+                i.abort_local(id, H3Code::REQUEST_CANCELLED);
             }
             i.release_user(id);
         });

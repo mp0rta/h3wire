@@ -315,7 +315,7 @@ fn response(
         return Poll::Ready(match r {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(code)) => {
-                let _ = i.conn.abort(id, code);
+                i.abort_local(id, code);
                 Err(ErrorKind::StreamAborted {
                     code,
                     source: AbortSource::Local,
@@ -359,8 +359,7 @@ impl Drop for InFlight {
                 if let Some(b) = i.streams.get_mut(&id).and_then(|s| s.head.take()) {
                     i.conn.release(b);
                 }
-                // Err: the stream or connection is already over.
-                let _ = i.conn.abort(id, H3Code::REQUEST_CANCELLED);
+                i.abort_local(id, H3Code::REQUEST_CANCELLED);
                 i.release_user(id);
             }
             i.wake_driver();
