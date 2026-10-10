@@ -35,6 +35,14 @@ pub enum PeerObs {
         /// Payload length.
         len: usize,
     },
+    /// The transport reported a peer RESET_STREAM (seen even on streams the core does not
+    /// know, such as raw ones).
+    Reset {
+        /// The stream.
+        stream: StreamId,
+        /// The application error code.
+        code: u64,
+    },
     /// An HTTP datagram for a request stream.
     Datagram {
         /// The stream.
@@ -471,6 +479,7 @@ impl<C: Quic> CorePeer<C> {
                         self.inbox.entry(s).or_default().1 = true;
                     }
                     Err(ReadError::Reset(code)) => {
+                        self.trace.push(PeerObs::Reset { stream: s, code });
                         self.recvs.remove(&s);
                         self.inbox.remove(&s);
                         let _ = self.core.stream_reset_received(s, H3Code(code));

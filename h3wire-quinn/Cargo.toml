@@ -1,0 +1,31 @@
+[package]
+name = "h3wire-quinn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "quinn 0.11 transport for h3wire-async (HTTP/3)"
+repository = "https://github.com/mp0rta/h3wire"
+documentation = "https://docs.rs/h3wire-quinn"
+readme = "../README.md"
+keywords = ["http3", "quic", "quinn", "async", "masque"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+h3wire-async = { path = "../h3wire-async", version = "0.1.0" }
+# No runtime, TLS provider or verifier: the application picks them via its own quinn.
+quinn = { version = "0.11", default-features = false }
+# Named in `server`'s and `client`'s bounds.
+bytes = "1"
+http = "1"
+http-body = "1"
+tower-service = "0.3"
+
+[dev-dependencies]
+h3wire-async = { path = "../h3wire-async", version = "0.1.0", features = ["tokio", "__testing"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+sha2 = "0.10"
+futures = "0.3"
+http-body-util = "0.1"

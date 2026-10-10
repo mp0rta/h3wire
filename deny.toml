@@ -1,5 +1,14 @@
 [licenses]
-allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    # ring ("Apache-2.0 AND ISC"), rustls-webpki, untrusted: h3wire-quinn's dev-deps
+    # (quinn with rustls-ring, rcgen).
+    "ISC",
+    # subtle (via rustls): h3wire-quinn's dev-deps.
+    "BSD-3-Clause",
+]
 
 [bans]
 multiple-versions = "warn"
