@@ -32,7 +32,7 @@ impl Fields {
         self.entries.push((a..b, b..self.buf.len(), never_index));
     }
 
-    fn push_map(&mut self, map: &HeaderMap, skip_host: bool) {
+    fn push_map(&mut self, map: &HeaderMap, skip_host: bool, request: bool) {
         for (name, value) in map {
             if skip_host && name == HOST {
                 continue;
@@ -42,7 +42,7 @@ impl Fields {
                 || name == UPGRADE
                 || name.as_str() == "keep-alive"
                 || name.as_str() == "proxy-connection"
-                || (name == TE && value.as_bytes() != b"trailers");
+                || (name == TE && !(request && value.as_bytes().eq_ignore_ascii_case(b"trailers")));
             if !hop {
                 self.push(
                     name.as_str().as_bytes(),
@@ -88,20 +88,20 @@ pub(crate) fn request_fields(parts: &http::request::Parts) -> Result<Fields, Usa
             f.push(b":protocol", p.as_bytes(), false);
         }
     }
-    f.push_map(&parts.headers, used_host);
+    f.push_map(&parts.headers, used_host, true);
     Ok(f)
 }
 
 pub(crate) fn response_fields(parts: &http::response::Parts) -> Fields {
     let mut f = Fields::new();
     f.push(b":status", parts.status.as_str().as_bytes(), false);
-    f.push_map(&parts.headers, false);
+    f.push_map(&parts.headers, false, false);
     f
 }
 
 pub(crate) fn trailer_fields(map: &HeaderMap) -> Fields {
     let mut f = Fields::new();
-    f.push_map(map, false);
+    f.push_map(map, false, false);
     f
 }
 
@@ -122,12 +122,17 @@ pub(crate) fn request_from_block(b: &HeaderBlockRef<'_>) -> Result<http::Request
         H3Code::MESSAGE_ERROR
     }
     let method = Method::from_bytes(p.method.ok_or(H3Code::MESSAGE_ERROR)?).map_err(bad)?;
+    let headers = headers_from_block(b)?;
+    // RFC 9114 section 4.3.1: `Host` may stand in for `:authority`.
+    let authority = p
+        .authority
+        .or_else(|| headers.get(HOST).map(HeaderValue::as_bytes));
     let mut up = http::uri::Parts::default();
-    if let Some(s) = p.scheme {
-        up.scheme = Some(s.try_into().map_err(bad)?);
-    }
-    if let Some(a) = p.authority {
+    if let Some(a) = authority {
         up.authority = Some(a.try_into().map_err(bad)?);
+        if let Some(s) = p.scheme {
+            up.scheme = Some(s.try_into().map_err(bad)?);
+        }
     }
     if let Some(path) = p.path {
         up.path_and_query = Some(path.try_into().map_err(bad)?);
@@ -137,7 +142,7 @@ pub(crate) fn request_from_block(b: &HeaderBlockRef<'_>) -> Result<http::Request
     *req.method_mut() = method;
     *req.uri_mut() = uri;
     *req.version_mut() = Version::HTTP_3;
-    *req.headers_mut() = headers_from_block(b)?;
+    *req.headers_mut() = headers;
     if let Some(proto) = p.protocol {
         req.extensions_mut()
             .insert(Protocol::new(bytes::Bytes::copy_from_slice(proto)));

@@ -193,7 +193,15 @@ fn connection_specific_headers_are_stripped() {
     let f = request_fields(&parts(r)).unwrap();
     assert!(names(&f).iter().any(|x| x.0 == "te" && x.1 == "trailers"));
 
+    let r = Request::get("https://a/")
+        .header("te", "Trailers")
+        .body(())
+        .unwrap();
+    let f = request_fields(&parts(r)).unwrap();
+    assert!(names(&f).iter().any(|x| x.0 == "te"));
+
     let resp = Response::builder()
+        .header("te", "trailers")
         .header("connection", "close")
         .header("transfer-encoding", "chunked")
         .header("x-keep", "1")
@@ -204,6 +212,7 @@ fn connection_specific_headers_are_stripped() {
     assert_eq!(n, [":status", "x-keep"]);
 
     let mut m = http::HeaderMap::new();
+    m.insert("te", HeaderValue::from_static("trailers"));
     m.insert("keep-alive", HeaderValue::from_static("1"));
     m.insert("x-t", HeaderValue::from_static("v"));
     let n: Vec<_> = names(&trailer_fields(&m))
@@ -241,4 +250,16 @@ fn invalid_received_value_is_message_error() {
     ];
     let r = with_block(server(), &fields, request_from_block);
     assert_eq!(r.unwrap_err(), H3Code::MESSAGE_ERROR);
+}
+
+#[test]
+fn scheme_and_host_without_authority() {
+    let fields = [
+        FieldRef::new(b":method", b"GET"),
+        FieldRef::new(b":scheme", b"https"),
+        FieldRef::new(b":path", b"/x"),
+        FieldRef::new(b"host", b"b"),
+    ];
+    let r = with_block(server(), &fields, request_from_block).unwrap();
+    assert_eq!(r.uri(), "https://b/x");
 }
