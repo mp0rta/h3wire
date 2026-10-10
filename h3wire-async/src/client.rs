@@ -8,7 +8,7 @@ use crate::builder::Builder;
 use crate::driver::Driver;
 use crate::error::{BoxError, Error, ErrorKind};
 use crate::ext::{ConnInfo, Protocol};
-use crate::http_map::{request_fields, response_from_block};
+use crate::http_map::{Fields, request_fields, response_from_block};
 use crate::quic;
 use crate::rt::{BoxTask, Executor, Owns};
 use crate::state::{Dir, Inner, OnOpen, Open, Shared};
@@ -115,69 +115,63 @@ where
         self.shared.with(|i| refused(i)).map_or(Ok(()), Err)
     }
 
-    /// Send `req`; resolves at the final response HEADERS (1xx responses are ignored).
+    /// Send `req`; the returned future resolves at the final response HEADERS (1xx
+    /// responses are ignored).
     ///
-    /// - The request body is piped by an executor task spawned once the stream opens; it
-    ///   runs whether or not this future is polled. Dropping this future before it
-    ///   resolves cancels the request (`H3_REQUEST_CANCELLED`).
+    /// - The request is queued by this call, not by the first poll. Its body is piped by
+    ///   an executor task spawned once the stream opens, whether or not the returned
+    ///   future is ever polled. Dropping that future before it resolves cancels the
+    ///   request (`H3_REQUEST_CANCELLED`).
     /// - Without a URI authority, `Host` supplies `:authority`; with neither, or for a
-    ///   CONNECT whose body is not empty ([`Body::is_end_stream`]), it fails with
-    ///   [`ErrorKind::Usage`] before anything is sent.
-    /// - With a [`Protocol`] extension (Extended CONNECT) it first waits for the peer's
-    ///   SETTINGS, then fails with `Usage(NotNegotiated)` unless the peer enabled it.
+    ///   CONNECT whose body is not empty ([`Body::is_end_stream`]), the future fails with
+    ///   [`ErrorKind::Usage`] and nothing is sent.
+    /// - With a [`Protocol`] extension (Extended CONNECT) the future first waits for the
+    ///   peer's SETTINGS (only then is the request queued), and fails with
+    ///   `Usage(NotNegotiated)` unless the peer enabled it.
     pub fn send_request(
         &mut self,
         req: Request<B>,
     ) -> impl Future<Output = Result<Response<RecvBody>, Error>> + Send + use<B> {
         let shared = self.shared.clone();
-        let exec = self.exec.clone();
+        let start = self.start(req);
         async move {
-            let (parts, body) = req.into_parts();
-            let fields = request_fields(&parts).map_err(usage)?;
-            let connect = parts.method == Method::CONNECT;
-            if connect && !body.is_end_stream() {
-                return Err(usage(UsageError::WrongPhase));
-            }
-            if parts.extensions.get::<Protocol>().is_some() {
-                let s = ConnInfo::new(shared.clone()).settings().await;
-                let Some(s) = s else {
-                    return Err(shared.with(|i| i.close.as_ref().expect("closed").to_error()));
-                };
-                if !s.enable_connect_protocol {
-                    return Err(usage(UsageError::NotNegotiated));
+            let mut f = match start? {
+                Ok(f) => f,
+                Err(req) => {
+                    let s = ConnInfo::new(shared.clone()).settings().await;
+                    let Some(s) = s else {
+                        return Err(shared.with(|i| i.close.as_ref().expect("closed").to_error()));
+                    };
+                    if !s.enable_connect_protocol {
+                        return Err(usage(UsageError::NotNegotiated));
+                    }
+                    enqueue(&shared, req)?
                 }
-            }
-            // CONNECT goes without FIN and without a pipe (Task 8 takes it from there).
-            let end = !connect && body.is_end_stream();
-            let on_open = (!connect && !end).then(|| {
-                let sh = shared.clone();
-                Box::new(move |id| spawn_body_pipe(sh, id, body, &exec, Owns::Send)) as OnOpen
-            });
-            let mut req = Some((fields, end, on_open));
-            // On refusal `req` (it may own the body) is dropped after the lock.
-            let ticket = shared.with(|i| {
-                if let Some(e) = refused(i) {
-                    return Err(e);
-                }
-                let t = i.next_open;
-                i.next_open += 1;
-                let o = Open {
-                    req: req.take(),
-                    done: None,
-                    waker: None,
-                };
-                i.opens.insert(t, o);
-                i.wake_driver();
-                Ok(t)
-            })?;
-            let mut f = InFlight {
-                shared,
-                ticket,
-                id: None,
-                over: false,
             };
             poll_fn(|cx| f.poll(cx)).await
         }
+    }
+
+    /// Validate `req` and queue it; an Extended CONNECT comes back unqueued, to be queued
+    /// once the peer's SETTINGS allow it.
+    fn start(&self, req: Request<B>) -> Result<Result<InFlight, Queued>, Error> {
+        let (parts, body) = req.into_parts();
+        let fields = request_fields(&parts).map_err(usage)?;
+        let connect = parts.method == Method::CONNECT;
+        if connect && !body.is_end_stream() {
+            return Err(usage(UsageError::WrongPhase));
+        }
+        // CONNECT goes without FIN and without a pipe (Task 8 takes it from there).
+        let end = !connect && body.is_end_stream();
+        let on_open = (!connect && !end).then(|| {
+            let (sh, exec) = (self.shared.clone(), self.exec.clone());
+            Box::new(move |id| spawn_body_pipe(sh, id, body, &exec, Owns::Send)) as OnOpen
+        });
+        let req = (fields, end, on_open);
+        if parts.extensions.get::<Protocol>().is_some() {
+            return Ok(Err(req));
+        }
+        enqueue(&self.shared, req).map(Ok)
     }
 
     /// The peer's SETTINGS, if they have arrived.
@@ -195,6 +189,36 @@ where
     pub fn __debug_recv_accounting(&self) -> (usize, usize, usize) {
         ConnInfo::new(self.shared.clone()).__debug_recv_accounting()
     }
+}
+
+/// A request's HEADERS, whether they end the stream, and its body pipe.
+type Queued = (Fields, bool, Option<OnOpen>);
+
+/// Queue `req` for the driver to open its stream, unless new requests are refused.
+fn enqueue(shared: &Shared, req: Queued) -> Result<InFlight, Error> {
+    let mut req = Some(req);
+    // On refusal `req` (it may own the body) is dropped after the lock.
+    let ticket = shared.with(|i| {
+        if let Some(e) = refused(i) {
+            return Err(e);
+        }
+        let t = i.next_open;
+        i.next_open += 1;
+        let o = Open {
+            req: req.take(),
+            done: None,
+            waker: None,
+        };
+        i.opens.insert(t, o);
+        i.wake_driver();
+        Ok(t)
+    })?;
+    Ok(InFlight {
+        shared: shared.clone(),
+        ticket,
+        id: None,
+        over: false,
+    })
 }
 
 /// A request from its submission to its final response. Dropped before that, it cancels

@@ -186,6 +186,23 @@ fn request_body_continues_without_polling_response() {
     });
 }
 
+#[test]
+fn request_body_sent_before_first_poll() {
+    let (_net, mut send, conn, mut peer, exec) =
+        client::<TestBody>(&Builder::new(), Config::default());
+    let _drv = spawn(&exec, conn);
+    let chunk = [6u8; 30_000];
+    let body = TestBody::data(&[&chunk[..]; 8]);
+    run(&exec, async {
+        // Queued by the call itself: the body goes out before the future is ever polled.
+        let mut resp = Box::pin(send.send_request(req(Method::POST, "https://a/", body)));
+        peer.run_until(|p| finished(p, S0)).await;
+        assert_eq!(peer.body(S0).len(), 240_000);
+        peer.send_headers(S0, &[(":status", "200")], true).unwrap();
+        assert_eq!(status(drive(&mut peer, &mut resp).await), 200);
+    });
+}
+
 fn extended_connect(enabled: bool) {
     let mut cfg = Config::default();
     cfg.enable_connect_protocol = enabled;
@@ -426,6 +443,16 @@ fn dropped_response_future_cancels_request() {
         let stop = MockObs::Stop {
             side: Side::Client,
             stream: S0,
+            code: H3Code::REQUEST_CANCELLED.0,
+        };
+        peer.run_until(|_| net.trace().contains(&stop)).await;
+        // Never polled: dropping it still cancels.
+        let r = send.send_request(get("https://a/b"));
+        peer.run_until(|p| seen(p, S4)).await;
+        drop(r);
+        let stop = MockObs::Stop {
+            side: Side::Client,
+            stream: S4,
             code: H3Code::REQUEST_CANCELLED.0,
         };
         peer.run_until(|_| net.trace().contains(&stop)).await;
