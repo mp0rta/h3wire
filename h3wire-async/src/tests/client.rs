@@ -824,3 +824,130 @@ fn zero_send_capacity_still_sends() {
         assert!(finished(&peer, S0));
     });
 }
+
+fn ext_connect() -> Request<String> {
+    let mut r = req(Method::CONNECT, "https://a/chat", String::new());
+    r.extensions_mut()
+        .insert(Protocol::from_static("connect-udp"));
+    r
+}
+
+fn connect_enabled() -> Config {
+    let mut cfg = Config::default();
+    cfg.enable_connect_protocol = true;
+    cfg
+}
+
+/// An Extended CONNECT whose `send_request` future outlives the last `SendRequest`
+/// keeps the connection open until it is queued: it is sent, answered 2xx, its tunnel
+/// works, and the driver closes cleanly once the tunnel ends. `deferred`: the peer's
+/// SETTINGS arrive only after the drop.
+fn ext_connect_outlives_senders(deferred: bool) {
+    let (net, mut send, conn, mut peer, exec) =
+        client::<String>(&Builder::new(), connect_enabled());
+    peer.defer_control(deferred);
+    let drv = spawn(&exec, conn);
+    run(&exec, async {
+        if !deferred {
+            settle(&mut peer).await;
+            assert!(send.peer_settings().is_some(), "SETTINGS arrived");
+        }
+        let f = send.send_request(ext_connect());
+        drop(send);
+        let out = spawn(&exec, f);
+        settle(&mut peer).await;
+        assert!(!done(&drv), "the pending CONNECT keeps the connection open");
+        if deferred {
+            assert!(!done(&out), "waits for the peer's SETTINGS");
+            peer.bind_control_now();
+        }
+        peer.run_until(|p| seen(p, S0) || done(&out)).await;
+        assert!(has(&peer.headers(S0)[0], ":protocol", "connect-udp"));
+        peer.send_headers(S0, &[(":status", "200")], false).unwrap();
+        peer.run_until(|_| done(&out)).await;
+        let mut resp = take(&out).expect("a response");
+        assert_eq!(resp.status(), 200);
+        let mut t = upgrade::on(&mut resp).await.expect("a tunnel");
+        t.send(Bytes::from_static(b"ping")).await.unwrap();
+        t.finish().unwrap();
+        peer.run_until(|p| finished(p, S0)).await;
+        assert_eq!(peer.body(S0), b"ping");
+        peer.send_body(S0, b"pong", true);
+        let r = spawn(&exec, async move {
+            let mut got = Vec::new();
+            while let Some(b) = t.recv().await.unwrap() {
+                got.extend_from_slice(&b);
+            }
+            got
+        });
+        peer.run_until(|_| done(&r)).await;
+        assert_eq!(take(&r), b"pong");
+        for _ in 0..4 {
+            settle(&mut peer).await;
+        }
+        assert!(done(&drv), "the driver ended");
+    });
+    take(&drv).expect("a clean close");
+    assert_eq!(net.closed_with(Side::Client), Some(0x100));
+}
+
+#[test]
+fn ext_connect_after_settings_outlives_senders() {
+    ext_connect_outlives_senders(false);
+}
+
+#[test]
+fn ext_connect_before_settings_outlives_senders() {
+    ext_connect_outlives_senders(true);
+}
+
+/// Dropping a pending Extended CONNECT (still waiting for SETTINGS) after the last
+/// `SendRequest` lets the graceful shutdown proceed.
+#[test]
+fn dropping_pending_ext_connect_after_senders_closes() {
+    let (net, mut send, conn, mut peer, exec) =
+        client::<String>(&Builder::new(), connect_enabled());
+    peer.defer_control(true);
+    let drv = spawn(&exec, conn);
+    run(&exec, async {
+        let f = send.send_request(ext_connect());
+        drop(send);
+        let mut f = Box::pin(f);
+        assert!(poll_once(&mut f).await.is_pending(), "waits for SETTINGS");
+        settle(&mut peer).await;
+        assert!(!done(&drv), "the pending CONNECT keeps the connection open");
+        drop(f);
+        for _ in 0..4 {
+            settle(&mut peer).await;
+        }
+        assert!(done(&drv), "the driver ended");
+        assert!(!seen(&peer, S0), "nothing sent");
+    });
+    take(&drv).expect("a clean close");
+    assert_eq!(net.closed_with(Side::Client), Some(0x100));
+}
+
+/// An Extended CONNECT started after graceful shutdown began is refused.
+#[test]
+fn ext_connect_after_graceful_shutdown_is_refused() {
+    let (net, mut send, mut conn, mut peer, exec) =
+        client::<String>(&Builder::new(), connect_enabled());
+    run(&exec, async {
+        drive_until(&mut peer, &mut conn, |_| send.peer_settings().is_some()).await;
+        Pin::new(&mut conn).graceful_shutdown();
+        let k = err_kind(send.send_request(ext_connect()).await);
+        assert!(
+            matches!(
+                k,
+                ErrorKind::Closed {
+                    code: H3Code::NO_ERROR,
+                    by_peer: false
+                }
+            ),
+            "{k:?}"
+        );
+        drive(&mut peer, &mut conn).await.expect("a clean close");
+        assert!(!seen(&peer, S0), "nothing sent");
+    });
+    assert_eq!(net.closed_with(Side::Client), Some(0x100));
+}

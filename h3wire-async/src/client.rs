@@ -43,10 +43,10 @@ impl Builder {
         E: Executor<BoxTask>,
     {
         let driver = Driver::new(conn, Role::Client, self);
-        driver.shared().with(|i| i.senders = 1);
         let send = SendRequest {
             shared: driver.shared(),
             exec: BoxExec(Arc::new(move |t| exec.execute(t))),
+            _hold: Hold::new(&driver.shared()),
             _body: PhantomData,
         };
         Ok((send, ClientConnection { driver }))
@@ -63,37 +63,51 @@ impl Executor<BoxTask> for BoxExec {
     }
 }
 
-/// Sends requests on a client connection; `Clone`.
-///
-/// Dropping the last clone starts the connection's graceful shutdown (as
-/// [`ClientConnection::graceful_shutdown`]): requests already sent complete, then the
-/// driver closes with `H3_NO_ERROR` and resolves `Ok`.
-pub struct SendRequest<B> {
-    pub(crate) shared: Shared,
-    exec: BoxExec,
-    _body: PhantomData<fn(B)>,
-}
+/// Keeps a client open: counted in `Inner::senders`, the last one gone starts the
+/// graceful shutdown. Held by each `SendRequest` and by each Extended CONNECT not yet
+/// queued.
+struct Hold(Shared);
 
-impl<B> Clone for SendRequest<B> {
-    fn clone(&self) -> Self {
-        self.shared.with(|i| i.senders += 1);
-        SendRequest {
-            shared: self.shared.clone(),
-            exec: self.exec.clone(),
-            _body: PhantomData,
-        }
+impl Hold {
+    fn new(shared: &Shared) -> Self {
+        shared.with(|i| i.senders += 1);
+        Hold(shared.clone())
     }
 }
 
-impl<B> Drop for SendRequest<B> {
+impl Drop for Hold {
     fn drop(&mut self) {
-        self.shared.with(|i| {
+        self.0.with(|i| {
             i.senders -= 1;
             if i.senders == 0 {
                 i.graceful = true;
                 i.wake_driver();
             }
         });
+    }
+}
+
+/// Sends requests on a client connection; `Clone`.
+///
+/// Dropping the last clone starts the connection's graceful shutdown (as
+/// [`ClientConnection::graceful_shutdown`]) once no Extended CONNECT is still waiting
+/// to be queued ([`send_request`](Self::send_request)): requests already sent complete,
+/// then the driver closes with `H3_NO_ERROR` and resolves `Ok`.
+pub struct SendRequest<B> {
+    pub(crate) shared: Shared,
+    exec: BoxExec,
+    _hold: Hold,
+    _body: PhantomData<fn(B)>,
+}
+
+impl<B> Clone for SendRequest<B> {
+    fn clone(&self) -> Self {
+        SendRequest {
+            shared: self.shared.clone(),
+            exec: self.exec.clone(),
+            _hold: Hold::new(&self.shared),
+            _body: PhantomData,
+        }
     }
 }
 
@@ -148,7 +162,9 @@ where
     ///   [`ErrorKind::Usage`] and nothing is sent.
     /// - With a [`Protocol`] extension (Extended CONNECT) the future first waits for the
     ///   peer's SETTINGS (only then is the request queued), and fails with
-    ///   `Usage(NotNegotiated)` unless the peer enabled it.
+    ///   `Usage(NotNegotiated)` unless the peer enabled it. Until it is queued (or fails,
+    ///   or is dropped) it keeps the connection open like a `SendRequest`: dropping the
+    ///   last `SendRequest` meanwhile does not refuse it.
     /// - A CONNECT is sent without FIN. A 2xx response carries the tunnel: take it with
     ///   [`upgrade::on`](crate::upgrade::on). Any other response finishes the request.
     /// - With [`RegisterDatagrams`] the request registers HTTP datagram semantics, and
@@ -162,7 +178,7 @@ where
         async move {
             let mut f = match start? {
                 Ok(f) => f,
-                Err(req) => {
+                Err((req, hold)) => {
                     let s = ConnInfo::new(shared.clone()).settings().await;
                     let Some(s) = s else {
                         return Err(shared.with(|i| i.close.as_ref().expect("closed").to_error()));
@@ -170,7 +186,9 @@ where
                     if !s.enable_connect_protocol {
                         return Err(usage(UsageError::NotNegotiated));
                     }
-                    enqueue(&shared, req)?
+                    let f = enqueue(&shared, req)?;
+                    drop(hold); // the queued request keeps the connection open now
+                    f
                 }
             };
             poll_fn(|cx| f.poll(cx)).await
@@ -178,8 +196,9 @@ where
     }
 
     /// Validate `req` and queue it; an Extended CONNECT comes back unqueued, to be queued
-    /// once the peer's SETTINGS allow it.
-    fn start(&self, req: Request<B>) -> Result<Result<InFlight, Queued>, Error> {
+    /// once the peer's SETTINGS allow it, with a `Hold` keeping the connection open
+    /// until then.
+    fn start(&self, req: Request<B>) -> Result<Result<InFlight, (Queued, Hold)>, Error> {
         let (parts, body) = req.into_parts();
         let fields = request_fields(&parts).map_err(usage)?;
         let connect = parts.method == Method::CONNECT;
@@ -195,7 +214,7 @@ where
         let dgram = parts.extensions.get::<RegisterDatagrams>().is_some();
         let req = ((fields, end, on_open), connect, dgram);
         if parts.extensions.get::<Protocol>().is_some() {
-            return Ok(Err(req));
+            return Ok(Err((req, Hold::new(&self.shared))));
         }
         enqueue(&self.shared, req).map(Ok)
     }
@@ -424,9 +443,10 @@ impl Drop for InFlight {
 }
 
 /// The client connection's driver: a future to spawn on the executor. It resolves `Ok`
-/// on a clean close (graceful shutdown, which dropping every [`SendRequest`] also starts,
-/// or the peer closing with `H3_NO_ERROR` or with the transport's `NO_ERROR`). When the transport fails, responses it already holds are
-/// delivered before the close. Dropping it closes the connection with `H3_NO_ERROR`.
+/// on a clean close (graceful shutdown, which dropping every [`SendRequest`] also starts
+/// once no Extended CONNECT is still waiting to be queued, or the peer closing with
+/// `H3_NO_ERROR` or with the transport's `NO_ERROR`). When the transport fails,
+/// responses it already holds are delivered before the close. Dropping it closes the connection with `H3_NO_ERROR`.
 pub struct ClientConnection<C: quic::Connection> {
     driver: Driver<C>,
 }

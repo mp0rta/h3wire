@@ -272,7 +272,8 @@ pub(crate) struct Inner {
     pub peer_goaway: bool,
     /// Graceful shutdown started: no new requests; the driver closes once drained.
     pub graceful: bool,
-    /// Client: live `SendRequest` clones; the last one gone starts graceful shutdown.
+    /// Client: live `Hold`s (`SendRequest` clones, Extended CONNECTs not yet queued);
+    /// the last one gone starts graceful shutdown.
     pub senders: usize,
     pub streams: HashMap<StreamId, StreamState>,
     /// Server: streams whose request head was delivered, waiting for dispatch.
