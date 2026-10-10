@@ -408,7 +408,12 @@ impl<C: Quic> CorePeer<C> {
                             o.body.push_front((payload, end));
                             break;
                         }
-                        Err(UsageError::Closed(_) | UsageError::UnknownStream) => {
+                        // WrongPhase: the send side ended (the server stopped it).
+                        Err(
+                            UsageError::Closed(_)
+                            | UsageError::UnknownStream
+                            | UsageError::WrongPhase,
+                        ) => {
                             o.body.clear();
                             break;
                         }

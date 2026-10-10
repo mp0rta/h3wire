@@ -4,12 +4,15 @@
 //! h3wire-async client and server on `MockNet`, checked by the oracle [`check`] after
 //! every op; then a cleanup phase, a graceful shutdown and the liveness assertion.
 //!
-//! The ops act on both sides through the public API, so the peer-side controls of a
-//! `CorePeer` (reset, STOP_SENDING, abort, shutdown) come from the other endpoint:
-//! dropped readers and response futures, tunnel aborts, body errors, graceful shutdown.
+//! A case runs either two h3wire-async endpoints, or an h3wire-async server facing a
+//! raw `CorePeer` client. The peer adds what the async client never produces:
+//! STOP_SENDING or RESET_STREAM alone on a chosen direction, a control stream (SETTINGS)
+//! held back until after request HEADERS, raw frames the core does not write (unknown
+//! types, empty DATA, a forbidden frame), and datagrams sent before the request's
+//! HEADERS go out and before the server registers.
 
 use crate::__testing::exec::TestExec;
-use crate::__testing::{Ack, MockConn, MockNet, MockObs, Side};
+use crate::__testing::{Ack, CorePeer, MockConn, MockNet, MockObs, PeerObs, Side};
 use crate::body::RecvBody;
 use crate::builder::Builder;
 use crate::client::{ClientConnection, SendRequest};
@@ -17,12 +20,12 @@ use crate::datagram::{DatagramSlot, Datagrams, RegisterDatagrams};
 use crate::error::{BoxError, Error, ErrorKind};
 use crate::ext::ConnInfo;
 use crate::server::ServerConnection;
-use crate::state::Shared;
+use crate::state::{Inner, Shared};
 use crate::upgrade::{self, OnUpgrade, TunnelRecv, TunnelSend};
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
-use h3wire::{H3Code, StreamId};
+use h3wire::{AbortSource, Config as CoreConfig, Event, H3Code, Role, StreamId};
 use http::{HeaderMap, HeaderValue, Method, Request, Response};
 use http_body::{Body, Frame};
 use proptest::prelude::*;
@@ -32,7 +35,7 @@ use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::AssertUnwindSafe;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use tower_service::Service;
@@ -66,7 +69,9 @@ enum Kind {
 /// op acts on; an op with nothing to act on does nothing.
 #[derive(Clone, Debug)]
 enum Op {
-    /// Client `send_request`; `dgram` adds `RegisterDatagrams`.
+    /// Client `send_request`; `dgram` adds `RegisterDatagrams`. A `CorePeer` client
+    /// sends the HEADERS and, with `dgram`, a datagram for the stream at once (before
+    /// the HEADERS are written).
     Request {
         kind: Kind,
         dgram: bool,
@@ -117,8 +122,47 @@ enum Op {
     Shutdown(Side),
     /// Both transports die.
     Kill,
+    /// `CorePeer` client: STOP_SENDING alone (the response direction).
+    PeerStop(u8),
+    /// `CorePeer` client: RESET_STREAM alone (the request direction).
+    PeerReset(u8),
+    /// `CorePeer` client: raw bytes on the request stream.
+    PeerRaw(u8, Raw),
+    /// `CorePeer` client: open the held-back control stream (SETTINGS).
+    BindControl,
     /// Drop the connection future (closes with `H3_NO_ERROR`).
     DropConn(Side),
+}
+
+/// Raw frames a `CorePeer` writes past its core.
+#[derive(Clone, Copy, Debug)]
+enum Raw {
+    /// A reserved (unknown) frame type with a payload: ignored by the receiver.
+    Grease,
+    /// An empty DATA frame.
+    EmptyData,
+    /// An HTTP/2-only frame type (0x02): a connection error.
+    Forbidden,
+}
+
+impl Raw {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            // Type 0x21 (reserved), length 3.
+            Raw::Grease => &[0x21, 3, 1, 2, 3],
+            Raw::EmptyData => &[0x00, 0],
+            Raw::Forbidden => &[0x02, 1, 0],
+        }
+    }
+}
+
+/// One case's endpoints: the limits of each side, and `Some(defer_control)` for a
+/// `CorePeer` client.
+#[derive(Clone, Debug)]
+struct Setup {
+    client: Limits,
+    server: Limits,
+    peer: Option<bool>,
 }
 
 /// One side's builder limits.
@@ -213,8 +257,7 @@ impl Service<Request<RecvBody>> for Svc {
 
 /// Inside a Service future: dropped while still `live` means the task was cancelled,
 /// which spec §4.6 (and the Task 7 ruling) allows only once both directions are terminal
-/// (or the connection closed). The ruling is restated here, not taken from
-/// `StreamState`, so the oracle stays independent of the code it checks.
+/// (or the connection closed): [`task_over`].
 struct CancelGuard {
     shared: Shared,
     id: StreamId,
@@ -228,22 +271,28 @@ impl Drop for CancelGuard {
             return;
         }
         let id = self.id;
-        let ok = self.shared.with(|i| {
-            i.close.is_some()
-                || i.streams.get(&id).is_none_or(|st| {
-                    let r = &st.recv;
-                    let consumed = r.error.is_some()
-                        || r.abandoned
-                        || (r.eof && r.queue.is_empty() && r.trailers.is_none());
-                    st.send.done && consumed
-                })
-        });
+        let ok = self.shared.with(|i| task_over(i, id));
         if !ok {
             self.log.lock().unwrap().push(format!(
                 "server task of {id:?} cancelled while a direction is live"
             ));
         }
     }
+}
+
+/// The server per-request task of `id` may be cancelled (spec §4.6, Task 7 ruling): the
+/// connection closed, or the send side is done and the receive side consumed ((a) the
+/// reader took EOF, (b) no reader remains, (c) reset or errored). Restated here, not taken
+/// from `StreamState`, so the oracle stays independent of the code it checks.
+fn task_over(i: &Inner, id: StreamId) -> bool {
+    i.close.is_some()
+        || i.streams.get(&id).is_none_or(|st| {
+            let r = &st.recv;
+            let consumed = r.error.is_some()
+                || r.abandoned
+                || (r.eof && r.queue.is_empty() && r.trailers.is_none());
+            st.send.done && consumed
+        })
 }
 
 /// Records any wake.
@@ -305,8 +354,9 @@ struct Half {
     got: usize,
     got_trailers: bool,
     got_end: Option<bool>,
-    /// Receive-side errors seen (reader and datagrams), for the final excuse check.
-    errs: Vec<Error>,
+    /// Receive-side errors seen (reader and datagrams), each with the trace length when
+    /// it was seen, for the final excuse check.
+    errs: Vec<(Error, usize)>,
     /// The datagram handle's end (`true`: `Ok(None)`).
     dg_end: Option<bool>,
 }
@@ -387,27 +437,59 @@ fn body_seen(p: Poll<Option<Result<Frame<Bytes>, Error>>>) -> Seen {
     }
 }
 
+/// Coverage counters of the peer-only generators, summed over every case of the run;
+/// printed when `H3WIRE_PROPS_STATS` is set.
+#[derive(Clone, Copy, Debug)]
+enum Stat {
+    PeerCases,
+    PeerStop,
+    PeerReset,
+    RawGrease,
+    RawEmptyData,
+    RawForbidden,
+    /// The server got a request while the peer still held its SETTINGS back.
+    HeadersBeforeSettings,
+    /// A datagram sent with the request, before its HEADERS were written.
+    EarlyDatagram,
+    /// The server held pending (unregistered) datagrams of a peer request.
+    PendingDatagrams,
+}
+
+static STATS: [AtomicUsize; 9] = [const { AtomicUsize::new(0) }; 9];
+
+fn stat(s: Stat) {
+    STATS[s as usize].fetch_add(1, Ordering::Relaxed);
+}
+
 struct World {
     net: MockNet,
     exec: TestExec,
     flag: Arc<Flag>,
-    send: SendRequest<PBody>,
+    /// The h3wire-async client, or `peer`.
+    send: Option<SendRequest<PBody>>,
     client: Option<ClientConnection<MockConn>>,
+    peer: Option<CorePeer<MockConn>>,
     server: Option<ServerConnection<MockConn, Svc, TestExec>>,
-    /// Client, server.
-    shared: [Shared; 2],
+    /// The h3wire-async endpoints' state: client (none for a peer), server.
+    shared: [Option<Shared>; 2],
     limits: [Limits; 2],
+    /// The last settle ended quiescent.
+    quiet: bool,
+    /// Trace length when both transports were killed.
+    killed_at: Option<usize>,
+    /// The peer's control stream (SETTINGS) is still held back.
+    control_deferred: bool,
     handed: mpsc::UnboundedReceiver<Handed>,
     log: Log,
     reqs: Vec<Req>,
     blocked: HashSet<(Side, StreamId)>,
     early_wake: bool,
-    killed: bool,
     trace: Log,
 }
 
 impl World {
-    fn new(cl: &Limits, sl: &Limits, trace: Log) -> World {
+    fn new(setup: &Setup, trace: Log) -> World {
+        let (cl, sl) = (&setup.client, &setup.server);
         let (net, c, s) = MockNet::pair();
         let exec = TestExec::default();
         let log = Log::default();
@@ -420,23 +502,41 @@ impl World {
         let cell = svc.shared.clone();
         let server = sl.builder().serve_connection(s, svc, exec.clone());
         *cell.lock().unwrap() = Some(server.driver.shared());
-        let (send, client) =
-            futures::executor::block_on(cl.builder().handshake(c, exec.clone())).unwrap();
+        let (send, client, peer) = match setup.peer {
+            None => {
+                let (send, client) =
+                    futures::executor::block_on(cl.builder().handshake(c, exec.clone())).unwrap();
+                (Some(send), Some(client), None)
+            }
+            Some(defer) => {
+                let mut cfg = CoreConfig::default();
+                cfg.h3_datagram = true;
+                let mut p = CorePeer::new(Role::Client, cfg, c);
+                p.defer_control(defer);
+                (None, None, Some(p))
+            }
+        };
         World {
-            shared: [send.shared.clone(), server.driver.shared()],
+            shared: [
+                send.as_ref().map(|s| s.shared.clone()),
+                Some(server.driver.shared()),
+            ],
             net,
             exec,
             flag: Arc::default(),
             send,
-            client: Some(client),
+            client,
+            peer,
             server: Some(server),
             limits: [cl.clone(), sl.clone()],
+            quiet: true,
+            killed_at: None,
+            control_deferred: setup.peer == Some(true),
             handed,
             log,
             reqs: Vec::new(),
             blocked: HashSet::new(),
             early_wake: false,
-            killed: false,
             trace,
         }
     }
@@ -476,10 +576,16 @@ impl World {
                 }
             }
             self.take_requests();
+            // After the server: what the peer queued this op reaches the wire now.
+            if let Some(p) = &mut self.peer {
+                while p.poll_step(&mut cx).is_ready() {}
+            }
             if !self.flag.0.load(Ordering::SeqCst) {
+                self.quiet = true;
                 return true;
             }
         }
+        self.quiet = false;
         false
     }
 
@@ -488,6 +594,9 @@ impl World {
             let k: usize = req.headers()["x-k"].to_str().unwrap().parse().unwrap();
             let sid = req.body().stream_id();
             self.note(format!("server got request {k} on {sid:?}"));
+            if self.control_deferred {
+                stat(Stat::HeadersBeforeSettings);
+            }
             let r = &mut self.reqs[k];
             r.sid = Some(sid);
             r.reply = Some(reply);
@@ -514,6 +623,9 @@ impl World {
         let waker = self.waker();
         let mut cx = Context::from_waker(&waker);
         let cx = &mut cx;
+        if self.peer.is_some() && self.peer_op(op, cx) {
+            return;
+        }
         match *op {
             Op::Request { kind, dgram } => self.request(kind, dgram),
             Op::PollResponse(k) => {
@@ -658,12 +770,185 @@ impl World {
             Op::Coalesce(on) => self.net.coalesce_reads(on),
             Op::Shutdown(s) => self.shutdown(s),
             Op::Kill => {
-                self.killed = true;
+                let at = self.net.trace().len();
+                self.killed_at.get_or_insert(at); // the first kill counts
                 self.net.kill_transport(Side::Client, None);
                 self.net.kill_transport(Side::Server, None);
             }
+            // Without a `CorePeer` client.
+            Op::PeerStop(_) | Op::PeerReset(_) | Op::PeerRaw(..) | Op::BindControl => {}
             Op::DropConn(Side::Client) => self.client = None,
             Op::DropConn(Side::Server) => self.server = None,
+        }
+    }
+
+    /// The client side of `op` for a `CorePeer` client; `false` for server-side ops.
+    fn peer_op(&mut self, op: &Op, cx: &mut Context<'_>) -> bool {
+        // A request of the peer whose request direction is still open.
+        let open = |r: &Req| r.halves[0].sent_end.is_none();
+        // ... and may carry DATA: a CONNECT only once its 2xx arrived (else the peer's
+        // core refuses it).
+        let p = self.peer.as_ref().expect("peer");
+        let tunnel_up = |sid| {
+            let heads = p.headers(sid);
+            let st = heads
+                .first()
+                .and_then(|h| h.iter().find(|(n, _)| n == ":status").cloned());
+            st.is_some_and(|(_, v)| v.starts_with('2'))
+        };
+        let sendable =
+            |r: &Req| open(r) && (r.kind != Kind::Connect || tunnel_up(r.sid.expect("opened")));
+        match *op {
+            Op::Request { kind, dgram } => self.peer_request(kind, dgram, cx),
+            Op::Send(Side::Client, k, n, _) => {
+                if let Some(k) = self.pick(k, sendable) {
+                    let r = &mut self.reqs[k];
+                    let data = pattern(k, Side::Client, r.halves[0].sent, n.into());
+                    let p = self.peer.as_mut().expect("peer");
+                    p.send_body(r.sid.expect("opened"), &data, false);
+                    r.halves[0].sent += usize::from(n);
+                }
+            }
+            Op::Finish(Side::Client, k, _) => {
+                if let Some(k) = self.pick(k, open) {
+                    self.peer_finish(k);
+                }
+            }
+            Op::Abort(Side::Client, k) => {
+                if let Some(k) = self.pick(k, |r| r.sid.is_some()) {
+                    let r = &mut self.reqs[k];
+                    let p = self.peer.as_mut().expect("peer");
+                    let _ = p.abort(r.sid.expect("opened"), H3Code::MESSAGE_ERROR);
+                    r.halves[0].sent_end.get_or_insert(TxEnd::Failed);
+                }
+            }
+            Op::DgSend(Side::Client, k, n) => {
+                if let Some(k) = self.pick(k, |r| r.sid.is_some()) {
+                    self.peer_datagram(k, n.into());
+                }
+            }
+            Op::PeerStop(k) => {
+                if let Some(k) = self.pick(k, |r| r.sid.is_some()) {
+                    let sid = self.reqs[k].sid.expect("opened");
+                    self.peer
+                        .as_mut()
+                        .expect("peer")
+                        .stop_sending(sid, H3Code::REQUEST_CANCELLED);
+                    stat(Stat::PeerStop);
+                }
+            }
+            Op::PeerReset(k) => {
+                if let Some(k) = self.pick(k, |r| r.sid.is_some()) {
+                    let r = &mut self.reqs[k];
+                    let p = self.peer.as_mut().expect("peer");
+                    p.reset(r.sid.expect("opened"), H3Code::REQUEST_CANCELLED);
+                    r.halves[0].sent_end.get_or_insert(TxEnd::Failed);
+                    stat(Stat::PeerReset);
+                }
+            }
+            Op::PeerRaw(k, raw) => {
+                if let Some(k) = self.pick(k, |r| r.sid.is_some()) {
+                    let sid = self.reqs[k].sid.expect("opened");
+                    self.peer.as_mut().expect("peer").send_raw(sid, raw.bytes());
+                    stat(match raw {
+                        Raw::Grease => Stat::RawGrease,
+                        Raw::EmptyData => Stat::RawEmptyData,
+                        Raw::Forbidden => Stat::RawForbidden,
+                    });
+                }
+            }
+            Op::BindControl => self.bind_control(),
+            // The async client's own calls and connection: nothing for a peer.
+            Op::PollResponse(_)
+            | Op::DropResponse(_)
+            | Op::Shutdown(Side::Client)
+            | Op::DropConn(Side::Client) => {}
+            Op::Read(Side::Client, _)
+            | Op::DropReader(Side::Client, _)
+            | Op::Upgrade(Side::Client, _)
+            | Op::Register(Side::Client, _)
+            | Op::DgRecv(Side::Client, _)
+            | Op::DropDatagrams(Side::Client, _) => {}
+            _ => return false,
+        }
+        true
+    }
+
+    fn peer_request(&mut self, kind: Kind, dgram: bool, cx: &mut Context<'_>) {
+        let k = self.reqs.len();
+        if k == MAX_REQS {
+            return;
+        }
+        let p = self.peer.as_mut().expect("peer");
+        let Poll::Ready(Ok(sid)) = pin!(p.open_bidi()).poll(cx) else {
+            return;
+        };
+        let ks = k.to_string();
+        let (fields, end): (Vec<(&str, &str)>, bool) = match kind {
+            Kind::Connect => (vec![(":method", "CONNECT"), (":authority", "a:443")], false),
+            _ => {
+                let (m, path) = match kind {
+                    Kind::Get => ("GET", "/g"),
+                    _ => ("POST", "/p"),
+                };
+                let f = [
+                    (":method", m),
+                    (":scheme", "https"),
+                    (":authority", "a"),
+                    (":path", path),
+                ];
+                (f.to_vec(), kind == Kind::Get)
+            }
+        };
+        let mut fields = fields;
+        fields.push(("x-k", &ks));
+        if p.send_headers(sid, &fields, end).is_err() {
+            // Refused (GOAWAY): give the opened stream up.
+            p.reset(sid, H3Code::REQUEST_CANCELLED);
+            p.stop_sending(sid, H3Code::REQUEST_CANCELLED);
+            return;
+        }
+        let mut client = Half::default();
+        if end {
+            client.sent_end = Some(TxEnd::Fin);
+        }
+        self.reqs.push(Req {
+            kind,
+            sid: Some(sid),
+            resp: None,
+            status: None,
+            sent_status: None,
+            reply: None,
+            halves: [client, Half::default()],
+        });
+        // Sent now, so it reaches the server before the HEADERS are written.
+        if dgram && self.peer_datagram(k, 3) {
+            stat(Stat::EarlyDatagram);
+        }
+    }
+
+    /// `false` if the peer could not send it (not negotiated yet, or closed).
+    fn peer_datagram(&mut self, k: usize, n: usize) -> bool {
+        let mut d = vec![k as u8, idx(Side::Client) as u8];
+        d.extend_from_slice(&pattern(k, Side::Client, 0, n));
+        let sid = self.reqs[k].sid.expect("opened");
+        let r = self.peer.as_mut().expect("peer").send_datagram(sid, &d);
+        self.note(format!("  -> {r:?}"));
+        r.is_ok()
+    }
+
+    fn peer_finish(&mut self, k: usize) {
+        let r = &mut self.reqs[k];
+        let p = self.peer.as_mut().expect("peer");
+        // FIN only: trailers queued through the core would overtake body bytes the peer
+        // has not framed yet.
+        p.send_body(r.sid.expect("opened"), &[], true);
+        r.halves[0].sent_end = Some(TxEnd::Fin);
+    }
+
+    fn bind_control(&mut self) {
+        if std::mem::take(&mut self.control_deferred) {
+            self.peer.as_mut().expect("peer").bind_control_now();
         }
     }
 
@@ -688,7 +973,8 @@ impl World {
         if dgram {
             b = b.extension(RegisterDatagrams);
         }
-        let resp = self.send.send_request(b.body(body).unwrap());
+        let send = self.send.as_mut().expect("async client");
+        let resp = send.send_request(b.body(body).unwrap());
         let mut client = Half {
             chan,
             ..Half::default()
@@ -920,7 +1206,8 @@ impl World {
                 }
                 h.got_end.get_or_insert(false);
                 self.note(format!("  {who}: {e:?}"));
-                self.reqs[k].halves[idx(s)].errs.push(e);
+                let at = self.net.trace().len();
+                self.reqs[k].halves[idx(s)].errs.push((e, at));
             }
         }
         if let Some(b) = bad {
@@ -940,6 +1227,7 @@ impl World {
                 Poll::Ready(r) => r,
             };
             let ended = h.dg_end;
+            let at = self.net.trace().len();
             let bad = match r {
                 Ok(Some(b)) => {
                     if ended.is_some() {
@@ -956,7 +1244,7 @@ impl World {
                 }
                 Err(e) => {
                     h.dg_end = Some(false);
-                    h.errs.push(e);
+                    h.errs.push((e, at));
                     (ended == Some(true)).then(|| "an error after Ok(None)".to_string())
                 }
             };
@@ -988,6 +1276,26 @@ impl World {
     /// One cleanup step for request `k`: answer, end producers, take pending upgrades,
     /// drain consumers. `true` while anything of it is still open.
     fn wind_down(&mut self, k: usize, cx: &mut Context<'_>) -> bool {
+        // Take a client 2xx CONNECT's tunnel before its response could be dropped.
+        let r = &self.reqs[k];
+        let ok = r.status.is_some_and(|x| (200..300).contains(&x));
+        let c = &r.halves[0];
+        if r.kind == Kind::Connect && ok && !c.on_called && c.msg.is_some() {
+            self.upgrade(k, Side::Client, cx);
+        }
+        // Then consumers: what this step's own calls abort is read after the next
+        // settle, once the abort is on the wire.
+        for s in [Side::Client, Side::Server] {
+            if self.read(k, s, usize::MAX, cx) {
+                let h = &mut self.reqs[k].halves[idx(s)];
+                if h.rx.take().is_none() {
+                    h.msg = None;
+                }
+            }
+            if self.read_dg(k, s, usize::MAX, cx) {
+                self.reqs[k].halves[idx(s)].dg = None;
+            }
+        }
         self.poll_response(k, cx);
         let r = &mut self.reqs[k];
         if r.reply.is_some() {
@@ -1000,8 +1308,6 @@ impl World {
             self.respond(k, status, false);
         }
         for s in [Side::Client, Side::Server] {
-            let connect = self.reqs[k].kind == Kind::Connect;
-            let ok = self.reqs[k].status.is_some_and(|x| (200..300).contains(&x));
             let h = &mut self.reqs[k].halves[idx(s)];
             if h.chan.take().is_some() {
                 h.sent_end.get_or_insert(TxEnd::Fin);
@@ -1011,20 +1317,8 @@ impl World {
                     h.sent_end = Some(TxEnd::Fin);
                 }
             }
-            if s == Side::Client && connect && ok && !h.on_called && h.msg.is_some() {
-                self.upgrade(k, s, cx);
-            }
             if self.reqs[k].halves[idx(s)].up.is_some() {
                 self.upgrade(k, s, cx);
-            }
-            if self.read(k, s, usize::MAX, cx) {
-                let h = &mut self.reqs[k].halves[idx(s)];
-                if h.rx.take().is_none() {
-                    h.msg = None;
-                }
-            }
-            if self.read_dg(k, s, usize::MAX, cx) {
-                self.reqs[k].halves[idx(s)].dg = None;
             }
         }
         let r = &self.reqs[k];
@@ -1042,6 +1336,14 @@ impl World {
         self.net.max_write(None);
         self.net.ack_mode(Ack::Auto);
         self.net.ack_all();
+        if self.peer.is_some() {
+            self.bind_control();
+            for k in 0..self.reqs.len() {
+                if self.reqs[k].halves[0].sent_end.is_none() {
+                    self.peer_finish(k);
+                }
+            }
+        }
         let (mut last, mut stalled) = (String::new(), 0);
         while stalled < STALL_ROUNDS {
             if !self.settle() {
@@ -1097,8 +1399,14 @@ impl World {
         }
         // A closed connection reaps nothing more (a graceful close by one side may
         // overtake the other's stream teardown).
-        if !self.killed && self.client.is_some() && self.server.is_some() {
-            for (s, sh) in [Side::Client, Side::Server].iter().zip(&self.shared) {
+        let closed = self
+            .net
+            .trace()
+            .iter()
+            .any(|o| matches!(o, MockObs::Close { .. }));
+        if self.killed_at.is_none() && !closed {
+            let sides = [Side::Client, Side::Server].iter().zip(&self.shared);
+            for (s, sh) in sides.filter_map(|(s, sh)| Some((s, sh.as_ref()?))) {
                 let left: Vec<StreamId> = sh.with(|i| i.streams.keys().copied().collect());
                 if !left.is_empty() {
                     return Err(format!("{s:?} streams never completed: {left:?}"));
@@ -1137,9 +1445,10 @@ fn check(w: &World, mock: &[MockObs]) -> Result<(), String> {
     if w.exec.panics() > 0 {
         return Err("a task panicked".into());
     }
-    for (side, (l, sh)) in [Side::Client, Side::Server]
-        .into_iter()
-        .zip(w.limits.iter().zip(&w.shared))
+    let sides = [Side::Client, Side::Server].into_iter().zip(&w.limits);
+    for ((side, l), sh) in sides
+        .zip(&w.shared)
+        .filter_map(|(x, sh)| Some((x, sh.as_ref()?)))
     {
         let info = ConnInfo::new(sh.clone());
         let (queued, reservations, _) = info.__debug_recv_accounting();
@@ -1188,6 +1497,9 @@ fn check(w: &World, mock: &[MockObs]) -> Result<(), String> {
         if (n, b) != (pn, pb) {
             return Err(format!("{side:?}: pending datagrams miscounted"));
         }
+        if side == Side::Server && w.peer.is_some() && n > 0 {
+            stat(Stat::PendingDatagrams);
+        }
         if n > l.conn_cap.0 || b > l.conn_cap.1 {
             return Err(format!(
                 "{side:?}: {n} pending datagrams, {b} bytes on the connection"
@@ -1214,34 +1526,138 @@ fn check(w: &World, mock: &[MockObs]) -> Result<(), String> {
             return Err(format!("duplicate completion {o:?}"));
         }
     }
+    if w.quiet {
+        cancelled(w)?;
+    }
+    if let Some(p) = &w.peer {
+        peer_received(w, p)?;
+    }
     Ok(())
 }
 
-/// Every receive-side error has a cause on the wire: the peer's RESET, our own abort
-/// (STOP_SENDING), or the connection's end. In particular a peer STOP_SENDING (which
-/// only stops our sending) never ends receiving.
+/// After a quiescent settle, every executor task whose directions are over has been
+/// cancelled, even though the world still holds what its user future waits on: a server
+/// task's reply sender or response body, a client pipe's body sender.
+fn cancelled(w: &World) -> Result<(), String> {
+    for (k, r) in w.reqs.iter().enumerate() {
+        let Some(sid) = r.sid else {
+            continue;
+        };
+        let server = w.shared[1].as_ref().expect("async server");
+        let chan = r.halves[1].chan.as_ref();
+        if (r.reply.is_some() || chan.is_some()) && server.with(|i| task_over(i, sid)) {
+            if r.reply.as_ref().is_some_and(|x| !x.is_canceled()) {
+                return Err(format!(
+                    "server task of request {k} not cancelled (Service)"
+                ));
+            }
+            if chan.is_some_and(|c| !c.is_closed()) {
+                return Err(format!(
+                    "server task of request {k} not cancelled (body pipe)"
+                ));
+            }
+        }
+        let (Some(c), Some(client)) = (&r.halves[0].chan, &w.shared[0]) else {
+            continue;
+        };
+        let over =
+            client.with(|i| i.close.is_some() || i.streams.get(&sid).is_none_or(|st| st.send.done));
+        if over && !c.is_closed() {
+            return Err(format!("client body pipe of request {k} not cancelled"));
+        }
+    }
+    Ok(())
+}
+
+/// What a `CorePeer` client received: the server's bytes in order, the whole of them at
+/// a clean end, and the status the server sent.
+fn peer_received(w: &World, p: &CorePeer<MockConn>) -> Result<(), String> {
+    let finished: HashSet<StreamId> = p
+        .trace()
+        .iter()
+        .filter_map(|o| match o {
+            PeerObs::Event(Event::Finished(s)) => Some(*s),
+            _ => None,
+        })
+        .collect();
+    for (k, r) in w.reqs.iter().enumerate() {
+        let Some(sid) = r.sid else {
+            continue;
+        };
+        let body = p.body(sid);
+        if let Some(o) = (0..body.len()).find(|&o| body[o] != pat(k, Side::Server, o)) {
+            return Err(format!(
+                "peer got corrupt bytes of request {k} at offset {o}"
+            ));
+        }
+        let server = &r.halves[1];
+        let complete = matches!(server.sent_end, Some(TxEnd::Fin | TxEnd::Trailers))
+            && body.len() == server.sent;
+        if finished.contains(&sid) && !complete {
+            return Err(format!(
+                "peer finished request {k} after {} bytes; the server sent {} ending {:?}",
+                body.len(),
+                server.sent,
+                server.sent_end
+            ));
+        }
+        let heads = p.headers(sid);
+        let status = heads
+            .first()
+            .and_then(|h| h.iter().find(|(n, _)| n == ":status"));
+        if let Some((_, v)) = status {
+            if r.sent_status.map(|x| x.to_string()).as_ref() != Some(v) {
+                return Err(format!(
+                    "peer got {v} for request {k}; sent {:?}",
+                    r.sent_status
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every receive-side error has a cause on the wire that came before it was seen:
+/// - `StreamAborted` from the peer: the peer's RESET_STREAM on that stream;
+/// - `StreamAborted` of our own (or a GOAWAY cutoff): our STOP_SENDING on it, or our
+///   CONNECTION_CLOSE (a graceful close may go out before a queued STOP_SENDING);
+/// - `Closed` / `Transport`: a CONNECTION_CLOSE, or both transports killed.
+///
+/// So a peer STOP_SENDING, which only stops our sending, never ends receiving.
 fn excuses(w: &World, mock: &[MockObs]) -> Result<(), String> {
-    let closed = w.killed || mock.iter().any(|o| matches!(o, MockObs::Close { .. }));
+    let first = |f: &dyn Fn(&MockObs) -> bool| mock.iter().position(f);
+    let close = first(&|o| matches!(o, MockObs::Close { .. }));
+    let closed = close.into_iter().chain(w.killed_at).min();
     for (k, r) in w.reqs.iter().enumerate() {
         for s in [Side::Client, Side::Server] {
-            for e in &r.halves[idx(s)].errs {
+            for (e, at) in &r.halves[idx(s)].errs {
+                let before = |i: Option<usize>| i.is_some_and(|i| i < *at);
                 let ok = match (e.kind(), r.sid) {
-                    (ErrorKind::StreamAborted { .. }, Some(sid)) => {
-                        closed
-                            || mock.iter().any(|o| match *o {
-                                MockObs::Reset { side, stream, .. } => {
-                                    side == other(s) && stream == sid
-                                }
-                                MockObs::Stop { side, stream, .. } => side == s && stream == sid,
-                                _ => false,
-                            })
+                    // The peer's RESET_STREAM ends our receiving; our own abort ends it
+                    // with our STOP_SENDING (or our close).
+                    (ErrorKind::StreamAborted { source, .. }, Some(sid)) => {
+                        let peer = *source == AbortSource::Peer;
+                        before(first(&|o| match *o {
+                            MockObs::Reset { side, stream, .. } => {
+                                peer && side == other(s) && stream == sid
+                            }
+                            MockObs::Stop { side, stream, .. } => {
+                                !peer && side == s && stream == sid
+                            }
+                            // Our close overtook the STOP_SENDING of our abort.
+                            MockObs::Close { side, .. } => !peer && side == s,
+                            _ => false,
+                        }))
                     }
-                    (ErrorKind::Closed { .. } | ErrorKind::Transport(_), _) => closed,
+                    (ErrorKind::Closed { .. } | ErrorKind::Transport(_), _) => {
+                        closed.is_some_and(|c| c <= *at)
+                    }
                     _ => false,
                 };
                 if !ok {
                     return Err(format!(
-                        "{s:?} receive side of request {k} ended by {e:?} with no cause"
+                        "{s:?} receive side of request {k} ended by {e:?} (trace position {at}) \
+                         with no cause before it"
                     ));
                 }
             }
@@ -1250,8 +1666,11 @@ fn excuses(w: &World, mock: &[MockObs]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_case(cl: &Limits, sl: &Limits, ops: &[Op], trace: Log) -> Result<(), String> {
-    let mut w = World::new(cl, sl, trace);
+fn run_case(setup: &Setup, ops: &[Op], trace: Log) -> Result<(), String> {
+    let mut w = World::new(setup, trace);
+    if w.peer.is_some() {
+        stat(Stat::PeerCases);
+    }
     for op in ops {
         w.apply(op);
         if !w.settle() && !w.early_wake {
@@ -1304,6 +1723,12 @@ fn op() -> impl Strategy<Value = Op> {
         9 => any::<bool>().prop_map(Op::Coalesce),
         6 => side().prop_map(Op::Shutdown),
         1 => Just(Op::Kill),
+        // `CorePeer` client only (no-ops otherwise).
+        12 => k().prop_map(Op::PeerStop),
+        12 => k().prop_map(Op::PeerReset),
+        12 => (k(), prop_oneof![4 => Just(Raw::Grease), 4 => Just(Raw::EmptyData), 1 => Just(Raw::Forbidden)])
+            .prop_map(|(k, r)| Op::PeerRaw(k, r)),
+        9 => Just(Op::BindControl),
         1 => side().prop_map(Op::DropConn),
     ]
 }
@@ -1343,28 +1768,50 @@ fn random_ops_hold_invariants() {
         source_file: Some(file!()),
         ..Config::default()
     };
-    let strategy = (limits(), limits(), proptest::collection::vec(op(), 1..120));
-    let r = TestRunner::new(config).run(&strategy, |(cl, sl, ops)| {
-        run_case(&cl, &sl, &ops, Log::default()).map_err(TestCaseError::fail)
+    let peer = prop_oneof![Just(None), any::<bool>().prop_map(Some)];
+    let setup = (limits(), limits(), peer).prop_map(|(client, server, peer)| Setup {
+        client,
+        server,
+        peer,
     });
+    let strategy = (setup, proptest::collection::vec(op(), 1..120));
+    let r = TestRunner::new(config).run(&strategy, |(setup, ops)| {
+        run_case(&setup, &ops, Log::default()).map_err(TestCaseError::fail)
+    });
+    if std::env::var_os("H3WIRE_PROPS_STATS").is_some() {
+        let names = [
+            "peer cases",
+            "peer STOP_SENDING",
+            "peer RESET_STREAM",
+            "raw reserved frame",
+            "raw empty DATA",
+            "raw forbidden frame",
+            "request HEADERS before SETTINGS",
+            "datagram before HEADERS",
+            "pending datagram observations",
+        ];
+        for (n, c) in names.iter().zip(&STATS) {
+            eprintln!("STATS {n}: {}", c.load(Ordering::Relaxed));
+        }
+    }
     let Err(e) = r else {
         return;
     };
-    let TestError::Fail(why, (cl, sl, ops)) = e else {
+    let TestError::Fail(why, (setup, ops)) = e else {
         panic!("{e}");
     };
     // Replay the minimal case for its op trace.
     let trace = Log::default();
     let t = trace.clone();
-    let replay = std::panic::catch_unwind(AssertUnwindSafe(|| run_case(&cl, &sl, &ops, t)));
+    let replay = std::panic::catch_unwind(AssertUnwindSafe(|| run_case(&setup, &ops, t)));
     let mut h = DefaultHasher::new();
-    format!("{cl:?}{sl:?}{ops:?}").hash(&mut h);
+    format!("{setup:?}{ops:?}").hash(&mut h);
     let path = format!(
         "{}/../target/h3wire-async-props-{:016x}.trace",
         env!("CARGO_MANIFEST_DIR"),
         h.finish()
     );
-    let mut text = format!("{why}\nreplay: {replay:?}\nclient {cl:?}\nserver {sl:?}\n");
+    let mut text = format!("{why}\nreplay: {replay:?}\n{setup:?}\n");
     for line in trace.lock().unwrap().iter() {
         text.push_str(line);
         text.push('\n');
