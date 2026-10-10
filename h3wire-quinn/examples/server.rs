@@ -153,7 +153,7 @@ impl App {
                     Frame::data(Bytes::from_static(b"trailers\n")),
                     Frame::trailers(t),
                 ];
-                reply(200, frames.into_iter().collect())
+                reply(200, frames)
             }
             (Method::GET, "/goaway") => {
                 self.goaway.notify_one();
@@ -192,24 +192,29 @@ impl App {
 
 /// A response of `frames`; with none, an empty body that is at its end, as a CONNECT 2xx
 /// must be.
-fn reply(status: u16, frames: Vec<Frame<Bytes>>) -> Response<Body> {
-    let body = if frames.is_empty() {
+fn reply<I>(status: u16, frames: I) -> Response<Body>
+where
+    I: IntoIterator<Item = Frame<Bytes>>,
+    I::IntoIter: Send + 'static,
+{
+    let mut frames = frames.into_iter().peekable();
+    let body = if frames.peek().is_none() {
         Empty::new().map_err(|e| match e {}).boxed_unsync()
     } else {
-        StreamBody::new(futures::stream::iter(frames.into_iter().map(Ok))).boxed_unsync()
+        StreamBody::new(futures::stream::iter(frames.map(Ok))).boxed_unsync()
     };
     let mut r = Response::new(body);
     *r.status_mut() = StatusCode::from_u16(status).unwrap();
     r
 }
 
-/// `n` bytes of `b'a'` in 64 KiB DATA frames, without allocating them.
-fn a_bytes(n: usize) -> Vec<Frame<Bytes>> {
+/// `n` bytes of `b'a'` in 64 KiB DATA frames, made as they are sent: nothing is
+/// allocated, whatever `n` is.
+fn a_bytes(n: usize) -> impl Iterator<Item = Frame<Bytes>> + Send + 'static {
     static A: [u8; 65536] = [b'a'; 65536];
     (0..n)
         .step_by(A.len())
-        .map(|i| Frame::data(Bytes::from_static(&A[..A.len().min(n - i)])))
-        .collect()
+        .map(move |i| Frame::data(Bytes::from_static(&A[..A.len().min(n - i)])))
 }
 
 /// `e` and its sources, `: `-separated.

@@ -136,7 +136,8 @@ while IFS=$'\t' read -r cap peer version dir cmd status; do
 done <interop/cells.tsv
 
 # h3spec: failures are `<file>.hs:<line>:<col>: ` followed by `  <n>) <description>`.
-run "$PEERS" h3spec -n h3wire 4433 >"$W/h3spec.txt" 2>&1 || true
+# Bounded: 77 cases take a few seconds, each at most 2 s.
+run "$PEERS" timeout 300 h3spec -n h3wire 4433 >"$W/h3spec.txt" 2>&1 || true
 summary=$(grep -E '^[0-9]+ examples, [0-9]+ failures?' "$W/h3spec.txt" || echo "no summary: h3spec did not finish")
 h3_rows=()
 h3spec_new=0
@@ -153,7 +154,14 @@ while IFS=$'\t' read -r case desc; do
     h3_rows+=("| \`$case\` | $desc | $layer | $why |")
 done < <(awk '/^  [A-Za-z0-9]+\.hs:[0-9]+:[0-9]+: *$/ { c = $1; sub(/:$/, "", c); getline;
     sub(/^ *[0-9]+\) /, ""); print c "\t" $0 }' "$W/h3spec.txt")
-if ! grep -qE '^[0-9]+ examples' "$W/h3spec.txt"; then h3spec_new=$((h3spec_new + 1)); fi
+# The parse must account for every failure h3spec itself counts.
+reported=$(sed -nE 's/^[0-9]+ examples, ([0-9]+) failures?.*/\1/p' "$W/h3spec.txt")
+h3spec_problem=""
+if [ -z "$reported" ]; then
+    h3spec_problem="h3spec did not finish (no summary line)"
+elif [ "$reported" != "${#h3_rows[@]}" ]; then
+    h3spec_problem="h3spec counts $reported failures but ${#h3_rows[@]} were parsed"
+fi
 stale=$(grep -vE '^(#|$)' interop/h3spec-allowlist | awk '{print $1}' \
     | while read -r c; do grep -qF "$c" "$W/h3spec.txt" || echo "$c"; done)
 
@@ -182,7 +190,9 @@ total=$((SECONDS - start))
         echo
     fi
     echo "Failures not allowlisted: $h3spec_new. Allowlisted cases that passed: ${stale:-none}."
+    if [ -n "$h3spec_problem" ]; then echo "**h3spec check failed: $h3spec_problem.**"; fi
     echo "Output: \`target/interop/h3spec.txt\`."
 } >"$report"
 echo "wrote $report (${total} s)"
-[ "$mandatory_failed" = 0 ] && [ "$h3spec_new" = 0 ]
+if [ -n "$h3spec_problem" ]; then echo "h3spec check failed: $h3spec_problem" >&2; fi
+[ "$mandatory_failed" = 0 ] && [ "$h3spec_new" = 0 ] && [ -z "$h3spec_problem" ]
