@@ -9,7 +9,8 @@
 //!   resolves to the [`Tunnel`]; a non-2xx resolves it to [`ErrorKind::NotUpgraded`]. A
 //!   2xx with a non-empty body aborts the stream with `H3_INTERNAL_ERROR` (the
 //!   `OnUpgrade` sees `Usage`). A 2xx to a CONNECT nobody claimed, or whose `OnUpgrade`
-//!   was dropped, aborts it with `H3_REQUEST_CANCELLED` right after the HEADERS.
+//!   was dropped, aborts it with `H3_REQUEST_CANCELLED` once the HEADERS are queued; the
+//!   abort can discard them, so the client may never receive that response.
 //! - **Client:** a 2xx response to a CONNECT carries a pending upgrade; [`on`] resolves
 //!   at once. Dropping the response with the upgrade still inside, or an untaken
 //!   `OnUpgrade`, aborts with `H3_REQUEST_CANCELLED`. A non-2xx finishes the request.

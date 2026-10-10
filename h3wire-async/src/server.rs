@@ -142,12 +142,6 @@ where
             let Some((id, req, token, dgram)) = shared.with(next_request) else {
                 return Some(true);
             };
-            // Built first: if `call` panics, its drop still commits the abort.
-            let mut task = Commit {
-                fut: None,
-                shared: shared.clone(),
-                id,
-            };
             let mut req = req.map(|()| RecvBody::new(shared.clone(), id));
             req.extensions_mut().insert(ConnInfo::new(shared.clone()));
             let connect = req.method() == Method::CONNECT;
@@ -164,8 +158,14 @@ where
             }
             // Further request extensions go here.
             let head = req.method() == Method::HEAD;
+            // `call` runs in this future, as `poll_ready` does: a panic in it unwinds out
+            // of the `ServerConnection`.
             let fut = self.service.call(req);
-            task.fut = Some(Box::pin(respond(shared.clone(), id, head, connect, fut)));
+            let task = Commit {
+                fut: Some(Box::pin(respond(shared.clone(), id, head, connect, fut))),
+                shared: shared.clone(),
+                id,
+            };
             self.exec
                 .execute(Box::pin(Cancelable::new(Box::pin(task), token)));
         }
