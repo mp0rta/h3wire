@@ -30,7 +30,7 @@ fn zero_cap() -> Builder {
 }
 
 /// A HEADERS frame (static-table QPACK) for `fields`.
-fn headers_frame(fields: &[(&str, &str)]) -> Vec<u8> {
+pub(super) fn headers_frame(fields: &[(&str, &str)]) -> Vec<u8> {
     let f: Vec<FieldRef> = fields
         .iter()
         .map(|(n, v)| FieldRef::new(n.as_bytes(), v.as_bytes()))
@@ -90,7 +90,7 @@ fn take_body(sh: &Shared, s: StreamId) -> RecvBody {
 }
 
 /// The next frame of `body`, stepping `peer` while it pends.
-async fn next_frame(
+pub(super) async fn next_frame(
     peer: &mut CorePeer<MockConn>,
     body: &mut RecvBody,
 ) -> Option<Result<Frame<Bytes>, Error>> {

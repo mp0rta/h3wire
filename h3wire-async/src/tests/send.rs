@@ -25,7 +25,7 @@ const S: usize = 65_536;
 /// pending forever. `repeat` makes it an endless always-ready body. Counts polls; sets
 /// `dropped` when dropped.
 #[derive(Default)]
-struct TestBody {
+pub(super) struct TestBody {
     frames: VecDeque<Result<Frame<Bytes>, BoxError>>,
     repeat: Option<Bytes>,
     stall: bool,
@@ -34,7 +34,7 @@ struct TestBody {
 }
 
 impl TestBody {
-    fn data(chunks: &[&[u8]]) -> Self {
+    pub(super) fn data(chunks: &[&[u8]]) -> Self {
         TestBody {
             frames: chunks
                 .iter()
@@ -121,7 +121,7 @@ fn fins(net: &MockNet, s: StreamId) -> usize {
         .count()
 }
 
-fn finished(p: &CorePeer<MockConn>, s: StreamId) -> bool {
+pub(super) fn finished(p: &CorePeer<MockConn>, s: StreamId) -> bool {
     p.trace().contains(&PeerObs::Event(Event::Finished(s)))
 }
 

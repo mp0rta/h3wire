@@ -53,7 +53,6 @@ impl CancelToken {
     }
 
     /// Whether it fired; registers `cx`'s waker if not.
-    #[allow(dead_code)] // used by `Cancelable`
     fn poll_fired(&self, cx: &Context<'_>) -> bool {
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if !g.0 {
@@ -65,14 +64,12 @@ impl CancelToken {
 
 /// Wraps every executor task: once `token` fires it returns `Ready(())` and drops
 /// `inner` (as h2 does), so a user future that never touches a handle again still ends.
-#[allow(dead_code)] // the client and server spawn tasks (Tasks 6–7)
 pub(crate) struct Cancelable<F> {
     inner: Option<F>,
     token: CancelToken,
 }
 
 impl<F> Cancelable<F> {
-    #[allow(dead_code)] // the client and server spawn tasks (Tasks 6–7)
     pub(crate) fn new(inner: F, token: CancelToken) -> Self {
         Cancelable {
             inner: Some(inner),

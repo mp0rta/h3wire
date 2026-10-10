@@ -12,7 +12,7 @@ use crate::rt::{CancelToken, Owns};
 use bytes::Bytes;
 use h3wire::{Connection, H3Code, HeaderBlockId, StreamId};
 use http::HeaderMap;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Wake, Waker};
 
@@ -73,7 +73,7 @@ impl StreamState {
         }
     }
 
-    fn recv_terminal(&self) -> bool {
+    pub(crate) fn recv_terminal(&self) -> bool {
         self.recv.eof || self.recv.error.is_some()
     }
 }
@@ -131,8 +131,28 @@ pub(crate) struct RecvState {
     pub abandoned: bool,
 }
 
+/// Spawns a client request's body pipe once its stream exists.
+pub(crate) type OnOpen = Box<dyn FnOnce(StreamId) + Send>;
+
+/// A client request waiting for the driver to open its stream (spec §4.3); queued while
+/// `done` is `None`. Only its `send_request` removes it, outside the lock: it may own the
+/// user's body.
+pub(crate) struct Open {
+    /// The HEADERS, whether they end the stream, and the body pipe. Taken by the driver.
+    pub req: Option<(Fields, bool, Option<OnOpen>)>,
+    pub done: Option<Result<StreamId, Error>>,
+    pub waker: Option<Waker>,
+}
+
 pub(crate) struct Inner {
     pub conn: Connection,
+    /// Client requests by ticket, oldest first.
+    pub opens: BTreeMap<u64, Open>,
+    pub next_open: u64,
+    /// Client: the peer sent GOAWAY, so no new request may start.
+    pub peer_goaway: bool,
+    /// Graceful shutdown started: no new requests; the driver closes once drained.
+    pub graceful: bool,
     pub streams: HashMap<StreamId, StreamState>,
     /// Readiness tokens pushed by transport wakers, deduplicated by `ready_set`.
     pub ready: VecDeque<(StreamId, Dir)>,
@@ -191,7 +211,8 @@ impl Inner {
 
     /// The connection is over: record the first cause and wake every handle.
     pub(crate) fn fail(&mut self, cause: CloseCause) {
-        self.close.get_or_insert(cause);
+        let e = self.close.get_or_insert(cause).to_error();
+        self.fail_opens(&e);
         self.wake_conn();
         for st in self.streams.values_mut() {
             self.pending_wakers.extend(st.recv.waker.take());
@@ -199,6 +220,14 @@ impl Inner {
             for (_, t) in st.cancels.drain(..) {
                 self.pending_wakers.extend(t.fire());
             }
+        }
+    }
+
+    /// Fail every queued client request with `e`.
+    pub(crate) fn fail_opens(&mut self, e: &Error) {
+        for o in self.opens.values_mut().filter(|o| o.done.is_none()) {
+            o.done = Some(Err(e.clone()));
+            self.pending_wakers.extend(o.waker.take());
         }
     }
 
@@ -338,6 +367,10 @@ impl Shared {
     pub(crate) fn new(conn: Connection) -> Self {
         Shared(Arc::new(Mutex::new(Inner {
             conn,
+            opens: BTreeMap::new(),
+            next_open: 0,
+            peer_goaway: false,
+            graceful: false,
             streams: HashMap::new(),
             ready: VecDeque::new(),
             ready_set: HashSet::new(),

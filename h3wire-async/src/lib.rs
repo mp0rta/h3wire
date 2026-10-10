@@ -13,6 +13,7 @@
 pub mod __testing;
 pub mod body;
 pub mod builder;
+pub mod client;
 // Driver, shared state and OnceSlot are wired up by the client and server (Tasks 6–9).
 #[allow(dead_code)]
 mod driver;
@@ -31,6 +32,7 @@ mod state;
 mod tests;
 
 pub use builder::Builder;
+pub use client::{ClientConnection, SendRequest};
 pub use error::{BoxError, DatagramError, Error, ErrorKind};
 /// The sans-I/O core; its types appear in this crate's API.
 pub use h3wire as core;

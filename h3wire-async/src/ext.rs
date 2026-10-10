@@ -42,7 +42,6 @@ impl std::fmt::Debug for ConnInfo {
 }
 
 impl ConnInfo {
-    #[allow(dead_code)] // used by the client and server (Tasks 6–7)
     pub(crate) fn new(shared: Shared) -> Self {
         ConnInfo { shared }
     }

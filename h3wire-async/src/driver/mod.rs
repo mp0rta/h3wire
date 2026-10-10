@@ -5,11 +5,12 @@
 //! One `poll` runs rounds until nothing moves or the work budget (transport operations
 //! that returned `Ready`) is spent; then it wakes itself and yields. A round:
 //! 1. executes core actions and opens local uni streams;
-//! 2. accepts peer streams;
+//! 2. accepts peer streams; a client opens streams for queued requests;
 //! 3. writes the core's sendable streams (one write each);
 //! 4. serves readiness tokens round-robin (reads, writes, `poll_stopped`);
 //! 5. dispatches core events (also right after each `recv`, see `recv.rs`);
-//! 6. stops once the connection is closed.
+//! 6. closes with `H3_NO_ERROR` once a graceful shutdown has drained;
+//! 7. stops once the connection is closed.
 //!
 //! The shared lock is never held across a transport call: a transport may invoke a
 //! readiness waker synchronously, and that waker takes the lock.
@@ -21,9 +22,10 @@ use crate::builder::Builder;
 use crate::error::{Error, ErrorKind};
 use crate::http_map::headers_from_block;
 use crate::quic::{self, RecvStream, SendStream, TransportError};
+use crate::state::assert_unlocked;
 use crate::state::{CloseCause, Dir, Inner, Shared, StreamState};
 use bytes::Bytes;
-use h3wire::{Action, Event, H3Code, HeadersKind, Role, StreamId, UniKind};
+use h3wire::{Action, Event, H3Code, HeadersKind, Role, StreamId, UniKind, UsageError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -109,11 +111,15 @@ impl<C: quic::Connection> Driver<C> {
         self.shared.clone()
     }
 
-    /// `Some` once the connection is closed: `Ok` for a local `H3_NO_ERROR` close.
+    /// `Some` once the connection is closed. `Ok` for a clean close: an `H3_NO_ERROR`
+    /// close by either side (graceful shutdown, the driver dropped, or the peer closing
+    /// with `H3_NO_ERROR` once it is done). Handles still see the peer's close as
+    /// `Transport`, keeping its code (spec §4.7).
     fn outcome(&self) -> Option<Result<(), Error>> {
         self.shared.with(|i| {
             i.close.as_ref().map(|c| match c {
                 CloseCause::H3 { code, .. } if *code == H3Code::NO_ERROR => Ok(()),
+                CloseCause::Transport(e) if e.peer_app_code == Some(H3Code::NO_ERROR.0) => Ok(()),
                 c => Err(c.to_error()),
             })
         })
@@ -129,7 +135,34 @@ impl<C: quic::Connection> Driver<C> {
         moved |= self.write_sendable(budget)?;
         moved |= self.serve_ready(budget)?;
         self.shared.with(dispatch_events);
+        if self.shared.with(|i| i.graceful) && self.drained() {
+            self.close_no_error();
+            return Ok(true);
+        }
         Ok(moved)
+    }
+
+    /// Every request is over: none waits for its stream, and on each stream the response
+    /// head was taken, the receive side ended and the send half is acknowledged or reset.
+    fn drained(&self) -> bool {
+        self.shared.with(|i| {
+            i.opens.values().all(|o| o.done.is_some())
+                && i.streams.iter().all(|(id, st)| {
+                    st.head.is_none() && st.recv_terminal() && !self.sends.contains_key(id)
+                })
+        })
+    }
+
+    /// Close the connection with `H3_NO_ERROR` and fail every handle.
+    fn close_no_error(&mut self) {
+        self.conn.close(H3Code::NO_ERROR.0);
+        self.shared.with(|i| {
+            i.conn.transport_closed();
+            i.fail(CloseCause::H3 {
+                code: H3Code::NO_ERROR,
+                by_peer: false,
+            });
+        });
     }
 
     /// Execute the core's actions; open (and bind) local uni streams.
@@ -199,9 +232,9 @@ impl<C: quic::Connection> Driver<C> {
         Ok(moved)
     }
 
-    /// Accept peer uni streams, and request streams on a server.
+    /// Accept peer uni and bidi streams; a client opens streams for queued requests.
     fn accept(&mut self, cx: &mut Context<'_>, budget: &mut usize) -> Result<bool, TransportError> {
-        let mut moved = false;
+        let mut moved = self.open_requests(cx, budget)?;
         while *budget > 0 {
             let Poll::Ready(r) = self.conn.poll_accept_uni(cx) else {
                 break;
@@ -214,7 +247,7 @@ impl<C: quic::Connection> Driver<C> {
             self.shared.with(|i| i.push_ready(id, Dir::Recv));
         }
         // Task 7 gates this on `Service::poll_ready`.
-        while self.role == Role::Server && *budget > 0 {
+        while *budget > 0 {
             let Poll::Ready(r) = self.conn.poll_accept_bidi(cx) else {
                 break;
             };
@@ -222,6 +255,11 @@ impl<C: quic::Connection> Driver<C> {
             *budget -= 1;
             moved = true;
             let id = r.id();
+            if self.role == Role::Client {
+                // RFC 9114 §6.1: the core closes with H3_STREAM_CREATION_ERROR.
+                let _ = self.shared.with(|i| i.conn.recv(id, &[], false));
+                continue;
+            }
             self.sends.insert(id, s);
             self.recvs.insert(id, r);
             self.shared.with(|i| {
@@ -229,6 +267,58 @@ impl<C: quic::Connection> Driver<C> {
                 i.push_ready(id, Dir::Recv);
                 i.push_ready(id, Dir::Send);
             });
+        }
+        Ok(moved)
+    }
+
+    /// Client: open a stream for each queued request, oldest first, and queue its
+    /// HEADERS; then spawn its body pipe (outside the lock: it calls the executor).
+    fn open_requests(
+        &mut self,
+        cx: &mut Context<'_>,
+        budget: &mut usize,
+    ) -> Result<bool, TransportError> {
+        let mut moved = false;
+        while *budget > 0
+            && self
+                .shared
+                .with(|i| i.opens.values().any(|o| o.done.is_none()))
+        {
+            let Poll::Ready(r) = self.conn.poll_open_bidi(cx) else {
+                break;
+            };
+            let (mut s, mut r) = r?;
+            *budget -= 1;
+            moved = true;
+            let id = s.id();
+            let (sent, on_open) = self.shared.with(|i| {
+                // `None` only if its `send_request` was dropped since the check.
+                let Some(o) = i.opens.values_mut().find(|o| o.done.is_none()) else {
+                    return (false, None);
+                };
+                let (fields, end, on_open) = o.req.take().expect("queued");
+                let res = i.conn.send_headers(id, &fields.as_refs(), end);
+                let sent = res.is_ok();
+                o.done = Some(res.map(|()| id).map_err(|e| ErrorKind::Usage(e).into()));
+                i.pending_wakers.extend(o.waker.take());
+                if sent {
+                    i.streams.insert(id, StreamState::new());
+                    i.push_ready(id, Dir::Recv);
+                    i.push_ready(id, Dir::Send);
+                }
+                (sent, on_open)
+            });
+            if !sent {
+                s.reset(H3Code::REQUEST_CANCELLED.0);
+                r.stop(H3Code::REQUEST_CANCELLED.0);
+                continue;
+            }
+            self.sends.insert(id, s);
+            self.recvs.insert(id, r);
+            if let Some(f) = on_open {
+                assert_unlocked();
+                f(id);
+            }
         }
         Ok(moved)
     }
@@ -299,6 +389,7 @@ fn dispatch_events(i: &mut Inner) {
                     if let Some(st) = i.streams.get_mut(&stream) {
                         st.discovering = false;
                         st.head = Some(block);
+                        i.pending_wakers.extend(st.recv.waker.take());
                     } else {
                         i.conn.release(block);
                     }
@@ -339,7 +430,13 @@ fn dispatch_events(i: &mut Inner) {
                 i.send_terminal(stream);
             }
             Event::SendStopped { stream, .. } => i.send_terminal(stream),
-            // GOAWAY and uni stream types are dispatched by Tasks 6–9;
+            // Client: requests above the cutoff are aborted by the core (retryable);
+            // queued ones never start. (Server: a push ID, no effect.)
+            Event::GoAway { .. } => {
+                i.peer_goaway = true;
+                i.fail_opens(&ErrorKind::Usage(UsageError::GoingAway).into());
+            }
+            // Uni stream types are dispatched by Tasks 8–9;
             // `Closed` is handled where the cause is known.
             _ => {}
         }
@@ -382,16 +479,8 @@ impl<C: quic::Connection> Future for Driver<C> {
 
 impl<C: quic::Connection> Drop for Driver<C> {
     fn drop(&mut self) {
-        if self.shared.with(|i| i.close.is_some()) {
-            return;
+        if self.shared.with(|i| i.close.is_none()) {
+            self.close_no_error();
         }
-        self.conn.close(H3Code::NO_ERROR.0);
-        self.shared.with(|i| {
-            i.conn.transport_closed();
-            i.fail(CloseCause::H3 {
-                code: H3Code::NO_ERROR,
-                by_peer: false,
-            });
-        });
     }
 }

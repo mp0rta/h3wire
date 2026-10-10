@@ -32,7 +32,6 @@ impl std::fmt::Debug for RecvBody {
 }
 
 impl RecvBody {
-    #[allow(dead_code)] // the client and server hand it out (Tasks 6–7)
     pub(crate) fn new(shared: Shared, id: StreamId) -> Self {
         RecvBody { shared, id }
     }
@@ -129,7 +128,6 @@ impl Drop for RecvBody {
 /// already is `Bytes`, one copy otherwise. `Ok` once the body ended, or once the send
 /// side ended or the connection closed first; `Err` with the body's error, for the
 /// caller to act on (client: abort; server, Task 7: `task_failed`).
-#[allow(dead_code)] // the client and server pipe bodies (Tasks 6–7)
 pub(crate) async fn pipe_body<B>(shared: &Shared, id: StreamId, body: B) -> Result<(), BoxError>
 where
     B: Body,
@@ -187,7 +185,6 @@ where
     .await
 }
 
-#[allow(dead_code)] // the client and server pipe bodies (Tasks 6–7)
 fn end(shared: &Shared, id: StreamId, e: End) {
     shared.with(|i| {
         if let Some(st) = i.streams.get_mut(&id).filter(|s| !s.send.done) {
@@ -199,7 +196,6 @@ fn end(shared: &Shared, id: StreamId, e: End) {
 
 /// Spawn the client request-body pipe for `id`, wrapped in [`Cancelable`]. A body error
 /// aborts the stream with `H3_INTERNAL_ERROR` (spec §4.4).
-#[allow(dead_code)] // the client spawns it (Task 6)
 pub(crate) fn spawn_body_pipe<B, E>(shared: Shared, id: StreamId, body: B, exec: &E, owns: Owns)
 where
     B: Body + Send + 'static,
