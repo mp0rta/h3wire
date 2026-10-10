@@ -41,6 +41,10 @@ Our side is `h3wire-quinn/examples/{server,client}.rs`:
 
 ## Pass criteria
 
+Against our server, every cell also needs each connection it opened to close cleanly at
+our server: its graceful shutdown completed, or the peer closed with `H3_NO_ERROR` or
+with the QUIC transport's `NO_ERROR`. The server logs `closed cleanly`.
+
 - **GET, POST large body, concurrent (16):** the peer gets complete, correct bodies,
   checked by SHA-256. Bodies are 1 MiB and 8 MiB of `a`, and the upload is 10 MiB.
   The 16 concurrent requests share one connection.
@@ -62,8 +66,8 @@ Our side is `h3wire-quinn/examples/{server,client}.rs`:
 
 ## Matrix
 
-Run on 2026-10-11 with h3wire `5348e3e` plus this change. Every mandatory cell passed,
-in 8 consecutive runs.
+Run on 2026-10-11 with h3wire `21c0ebc` plus this change. Every mandatory cell passed,
+every connection to our server closed cleanly.
 
 | capability | peer | version | direction | result |
 |---|---|---|---|---|
@@ -113,16 +117,14 @@ Unsupported by peer tooling:
 
 ### Observations
 
-These are not judged, but are recorded from the cell logs:
+Recorded from the cell logs:
 
 - **curl closes with QUIC's transport-level `NO_ERROR`.** It sends CONNECTION_CLOSE type
   0x1c, code 0, instead of the application close `H3_NO_ERROR` (0x100). The default
   close error is set at `lib/vquic/cf-ngtcp2-cmn.c:1093` (`ngtcp2_ccerr_default`) and
-  sent at `:1259`.
-  - Our `ServerConnection` resolves `Err(Transport)` for that close, logged as
-    `closed with error: ... closed abruptly in the absence of any error`.
-  - The ngtcp2 client and quiche-client close with `H3_NO_ERROR`, which is `Ok`.
-  - The curl GOAWAY cell is unaffected: there our server closes first.
+  sent at `:1259`. h3wire-async treats it as a clean close (the connection future
+  resolves `Ok`; handles still see `Transport`). The ngtcp2 client and quiche-client
+  close with `H3_NO_ERROR`.
 - **quiche-server stops reading our 10 MiB upload with `STOP_SENDING(0)`** and sends a
   complete response. Our client keeps that response, as RFC 9114 §4.1 requires: the
   status (405 for POST, 200 for a GET with a body) and the body arrive, and the

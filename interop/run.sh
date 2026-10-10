@@ -12,11 +12,11 @@
 # mandatory failure, or on an h3spec failure not listed in interop/h3spec-allowlist.
 #
 # A cell's command runs as `sh -ec` in the image of its client side (peers image for
-# peer->h3wire, h3wire image for h3wire->peer) and passes when it exits 0. A GOAWAY
-# cell against our server also needs every connection it opened to have closed cleanly
-# at our server (its graceful shutdown completed: H3_NO_ERROR); seeing the final GOAWAY
-# is not required, since quinn's close may discard it (it is best-effort). Other
-# peer->h3wire cells log, without judging, how each connection ended.
+# peer->h3wire, h3wire image for h3wire->peer) and passes when it exits 0. A
+# peer->h3wire cell also needs every connection it opened to have closed cleanly at our
+# server (graceful shutdown, or the peer's H3_NO_ERROR or transport NO_ERROR close). In
+# a GOAWAY cell seeing the final GOAWAY is not required, since quinn's close may discard
+# it (it is best-effort).
 # Variables for commands: H3WIRE, NGTCP2, QUICHE (server URLs), CA (our certificate),
 # POST (10 MiB of 'a'), SHA_1M and SHA_8M (SHA-256 of 1 MiB and 8 MiB of 'a', served as
 # /bytes/1048576 and /bytes/8388608 by every server), HEX_POST (SHA-256 of POST, which
@@ -123,8 +123,7 @@ while IFS=$'\t' read -r cap peer version dir cmd status; do
             -e SHA_1M="$SHA_1M" -e SHA_8M="$SHA_8M" -e HEX_POST="$HEX_POST" \
             -e OUT="/work/out/$id" "$image" timeout 60 sh -ec "$cmd" \
             >"$W/out/$id.log" 2>&1 \
-            && { [ "$dir" != "peer->h3wire" ] || closed_cleanly "$before" >>"$W/out/$id.log" \
-                || [ "$cap" != GOAWAY ]; }; then
+            && { [ "$dir" != "peer->h3wire" ] || closed_cleanly "$before" >>"$W/out/$id.log"; }; then
             result=pass
         else
             result=fail
