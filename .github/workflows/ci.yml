@@ -44,10 +44,12 @@ jobs:
       - name: Verify the published packages
         run: |
           cargo package --workspace --locked
-          # `cargo package --workspace` also builds each packaged crate. Standalone tests of
-          # h3wire-async and h3wire-quinn need their dependency on crates.io (the packaged
-          # lock file records its checksum): add them to this loop once h3wire 0.2 and
-          # h3wire-async 0.1 are published.
+          # `cargo package --workspace` also builds each packaged crate. A standalone test
+          # of the packaged h3wire-async (and so h3wire-quinn) resolves h3wire from
+          # crates.io, checksum-checked against the local package: it can join this loop
+          # only while the local h3wire is byte-identical to a published h3wire version.
+          # Today it differs from crates.io 0.1.0 by SPDX comment lines; a 0.1.x core
+          # republish would fix that.
           for c in h3wire; do
             cargo test --manifest-path target/package/$c-[0-9]*/Cargo.toml --locked
           done
@@ -61,7 +63,11 @@ jobs:
       - run: cargo build -p h3wire-async --no-default-features
       # As a normal dependency, without dev-deps.
       - run: cargo check -p h3wire-async --features __testing
-      - run: test "$(cargo tree -p h3wire-async -e normal --no-default-features | grep -c tokio)" = 0
+      # Fail-closed: a failing `cargo tree` fails the step (bash -e) instead of counting 0.
+      - run: |
+          cargo tree -p h3wire-async -e normal --no-default-features > tree.txt
+          grep -q '^h3wire-async' tree.txt
+          ! grep -q tokio tree.txt
 
   msrv:
     if: github.event_name != 'schedule'
