@@ -102,7 +102,10 @@ impl sealed::Sealed for Request<RecvBody> {
                 let Some(st) = i.streams.get_mut(&c.id) else {
                     return;
                 };
-                if matches!(st.up, Up::None) && !st.final_sent {
+                // Only while the request's task lives: it settles the claim (response or
+                // `Commit`). After that nothing would, so the claim stays `None`
+                // (`NotUpgraded`).
+                if matches!(st.up, Up::None) && !st.final_sent && st.recv.task_owned {
                     st.up = Up::Claimed;
                     st.recv.detached = true;
                     st.recv.consumer_waiting = false;
@@ -125,7 +128,8 @@ impl sealed::Sealed for Response<RecvBody> {
 }
 
 /// Take the upgrade of `msg` (spec §4.5). Only the first call gets it; later ones, and
-/// messages without one, resolve to [`ErrorKind::NotUpgraded`].
+/// messages without one, resolve to [`ErrorKind::NotUpgraded`], as does a server call
+/// made after the request's Service task ended.
 pub fn on<T: Upgradable>(msg: &mut T) -> OnUpgrade {
     msg.on_upgrade()
 }

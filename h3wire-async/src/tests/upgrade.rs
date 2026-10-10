@@ -778,3 +778,22 @@ fn claim_settled_by_close_or_reset() {
     claim_outlived_by(false);
     claim_outlived_by(true);
 }
+
+/// Property-test regression: `upgrade::on` called after the request's task already ended
+/// without a response (a 2xx with a body), once the body has yielded the abort, must
+/// resolve rather than wait for a response that never comes.
+#[test]
+fn claim_after_task_ended_resolves() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    let r = run(&exec, async {
+        let (_resp, (mut req, tx)) = request(&mut p, connect()).await;
+        tx.send(reply(200, "body")).unwrap();
+        let e = poll_fn(|cx| Pin::new(req.body_mut()).poll_frame(cx)).await;
+        assert!(matches!(e, Some(Err(_))), "{e:?}");
+        quiesce().await;
+        let mut on = upgrade::on(&mut req);
+        poll_once(&mut on).await
+    });
+    assert!(matches!(r, Poll::Ready(Err(_))), "{r:?}");
+}
