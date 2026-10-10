@@ -194,9 +194,10 @@ fn poll_claim(i: &mut Inner, id: StreamId, cx: &mut Context<'_>) -> Poll<Result<
 }
 
 /// Server: the final response of a CONNECT went out (`Ok`: a 2xx), or will not (`Err`:
-/// what its `OnUpgrade` resolves to). Only a claim still waiting is settled, so the first
-/// outcome wins. A 2xx nobody holds the claim for is aborted with `H3_REQUEST_CANCELLED`.
+/// what its `OnUpgrade` resolves to, unless the connection's close or the stream's error
+/// came first). Only a claim still waiting is settled, so the first outcome wins. A 2xx nobody holds the claim for is aborted with `H3_REQUEST_CANCELLED`.
 pub(crate) fn settle(i: &mut Inner, id: StreamId, sent: Result<(), Error>) {
+    let close = i.close.as_ref().map(|c| c.to_error());
     let Some(st) = i.streams.get_mut(&id) else {
         return;
     };
@@ -204,7 +205,8 @@ pub(crate) fn settle(i: &mut Inner, id: StreamId, sent: Result<(), Error>) {
         i.pending_wakers.extend(st.recv.waker.take());
         st.up = match sent {
             Ok(()) => Up::Active,
-            Err(e) => Up::Failed(e),
+            // What already ended the stream wins over the caller's outcome.
+            Err(e) => Up::Failed(close.or_else(|| st.recv.error.clone()).unwrap_or(e)),
         };
     } else if sent.is_ok() {
         i.abort_local(id, H3Code::REQUEST_CANCELLED);

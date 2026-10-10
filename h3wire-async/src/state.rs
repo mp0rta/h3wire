@@ -387,6 +387,14 @@ impl Inner {
             return;
         }
         crate::driver::dispatch_events(self);
+        self.record_abort(id, code);
+    }
+
+    /// After a successful local `conn.abort(id, code)`: end, as `StreamAborted { code,
+    /// Local }`, each direction of `id` the core's own event has not ended (it emits none
+    /// after `Finished`). Inside `dispatch_events` call it right after the abort, before
+    /// a queued `Finished` is applied, so the reader sees the error, not a clean EOF.
+    pub(crate) fn record_abort(&mut self, id: StreamId, code: H3Code) {
         self.wake_driver();
         let Some(st) = self.streams.get_mut(&id) else {
             return;

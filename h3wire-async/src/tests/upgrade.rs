@@ -662,3 +662,119 @@ fn claimed_request_ended_then_service_fails() {
         Some(H3Code::INTERNAL_ERROR.0)
     );
 }
+
+/// Trailers the `http` crate cannot represent (a 64 KiB name) abort the stream with
+/// `H3_MESSAGE_ERROR`; the reader sees the abort, not a clean EOF, and the send side ends
+/// too. `inject`: the trailers and FIN reach the core in one `recv`, so `Finished` is
+/// queued before the trailers are dispatched and the core emits no `StreamAborted`.
+fn bad_trailers(inject: bool) {
+    let (_net, c, s) = MockNet::pair();
+    let exec = TestExec::default();
+    let (tx, mut reqs) = mpsc::unbounded();
+    let mut sb = Builder::new();
+    sb.max_encoded_field_section_size(200_000);
+    let srv = sb.serve_connection(s, Handoff(tx), exec.clone());
+    let shared = srv.driver.shared();
+    spawn(&exec, srv);
+    let mut peer = CorePeer::new(Role::Client, Config::default(), c);
+    let name = "a".repeat(65_536);
+    run(&exec, async {
+        let s = peer.open_bidi().await.unwrap();
+        let fields = [
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":authority", "a"),
+            (":path", "/"),
+        ];
+        peer.send_headers(s, &fields, false).unwrap();
+        peer.send_body(s, b"abc", false);
+        let (req, _tx) = drive(&mut peer, &mut reqs.next()).await.unwrap();
+        let mut body = req.into_body();
+        let f = super::recv::next_frame(&mut peer, &mut body).await;
+        assert_eq!(f.unwrap().unwrap().into_data().unwrap(), "abc");
+        if inject {
+            // HEADERS: QPACK prefix, a literal field line with a literal 65536-byte
+            // name (0x27 + 65529 as a 3-bit-prefix integer), value "v".
+            let mut block = vec![0x00, 0x00, 0x27, 0xf9, 0xff, 0x03];
+            block.extend_from_slice(name.as_bytes());
+            block.extend_from_slice(&[0x01, b'v']);
+            let mut frame = vec![0x01, 0x80, 0x01, 0x00, 0x08];
+            assert_eq!(block.len(), 65_544);
+            frame.extend_from_slice(&block);
+            shared.with(|i| {
+                assert!(i.conn.recv(s, &frame, true).is_ok());
+                crate::driver::dispatch_events(i);
+            });
+        } else {
+            peer.send_headers(s, &[(name.as_str(), "v")], true).unwrap();
+        }
+        let e = super::recv::next_frame(&mut peer, &mut body)
+            .await
+            .expect("not a clean EOF")
+            .expect_err("aborted");
+        assert!(
+            is_aborted(&e, H3Code::MESSAGE_ERROR, AbortSource::Local),
+            "{e:?}"
+        );
+        assert!(
+            shared.with(|i| i.streams[&s].send.done),
+            "the send side ended"
+        );
+    });
+}
+
+#[test]
+fn unrepresentable_trailers_abort_stream() {
+    bad_trailers(false);
+    bad_trailers(true);
+}
+
+/// A waiting claim whose stream ends by connection close (`reset`: false) or peer RESET
+/// (`true`): its `OnUpgrade` reports that cause even when the cancelled task commits
+/// first.
+fn claim_outlived_by(reset: bool) {
+    let (net, c, s) = MockNet::pair();
+    let exec = TestExec::default();
+    let (tx, mut reqs) = mpsc::unbounded();
+    let srv = Builder::new().serve_connection(s, Handoff(tx), exec.clone());
+    let shared = srv.driver.shared();
+    spawn(&exec, srv);
+    let mut peer = CorePeer::new(Role::Client, Config::default(), c);
+    let e = run(&exec, async {
+        let s = peer.open_bidi().await.unwrap();
+        let fields = [(":method", "CONNECT"), (":authority", "a:443")];
+        peer.send_headers(s, &fields, false).unwrap();
+        let (mut req, _reply) = drive(&mut peer, &mut reqs.next()).await.unwrap();
+        let mut on = upgrade::on(&mut req);
+        drop(req);
+        if reset {
+            peer.reset(s, H3Code::REQUEST_CANCELLED);
+        } else {
+            net.kill_transport(Side::Server, Some(0x10c));
+        }
+        // The task's `Commit` ran (the Service future is cancelled) before any poll.
+        let committed = || shared.with(|i| i.streams.get(&s).is_none_or(|st| !st.recv.task_owned));
+        if reset {
+            peer.run_until(|_| committed()).await;
+        } else {
+            until(committed).await;
+        }
+        poll_once(&mut on).await
+    });
+    let Poll::Ready(Err(e)) = e else {
+        panic!("the OnUpgrade must resolve with an error");
+    };
+    if reset {
+        assert!(is_aborted(&e, RC, AbortSource::Peer), "{e:?}");
+    } else {
+        let transport =
+            matches!(e.kind(), ErrorKind::Transport(t) if t.peer_app_code == Some(0x10c));
+        assert!(transport, "{e:?}");
+    }
+}
+
+#[test]
+fn claim_settled_by_close_or_reset() {
+    claim_outlived_by(false);
+    claim_outlived_by(true);
+}

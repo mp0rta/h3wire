@@ -396,9 +396,13 @@ pub(crate) fn dispatch_events(i: &mut Inner) {
                                 i.pending_wakers.extend(st.recv.waker.take());
                             }
                         }
-                        // Not representable as `http` headers; Err: the core is closed.
+                        // Not representable as `http` headers. Recorded now: when the same
+                        // `recv` reached FIN, `Finished` is already queued and the core
+                        // emits no `StreamAborted`. Err: the core is closed.
                         Ok(Err(code)) => {
-                            let _ = i.conn.abort(stream, code);
+                            if i.conn.abort(stream, code).is_ok() {
+                                i.record_abort(stream, code);
+                            }
                         }
                         Err(_) => {}
                     }
