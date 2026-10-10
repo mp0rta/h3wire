@@ -191,6 +191,18 @@ impl<C: Quic> CorePeer<C> {
         o.raw.push_back(Bytes::copy_from_slice(data));
     }
 
+    /// Like `send_raw`, but the chunk is `data` itself: it keeps `data`'s allocation, as
+    /// a QUIC stack's chunk keeps its packet buffer.
+    pub fn send_raw_bytes(&mut self, s: StreamId, data: Bytes) {
+        self.out.entry(s).or_default().raw.push_back(data);
+    }
+
+    /// Hand `d`, a whole QUIC DATAGRAM payload (quarter stream id included), to the
+    /// transport as is.
+    pub fn send_datagram_raw(&mut self, d: Bytes) {
+        let _ = self.conn.send_datagram(d);
+    }
+
     /// QUIC STOP_SENDING on `s`, bypassing the core.
     pub fn stop_sending(&mut self, s: StreamId, code: H3Code) {
         if let Some(mut r) = self.recvs.remove(&s) {

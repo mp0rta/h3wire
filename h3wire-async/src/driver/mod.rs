@@ -89,7 +89,7 @@ impl<C: quic::Connection> Driver<C> {
             discovery_len,
             read_ahead: b.read_ahead,
             read_ahead_cap: b.read_ahead_cap,
-            demand_chunk: b.demand_chunk.max(1),
+            demand_chunk: b.demand_chunk.max(crate::state::MIN_CHARGE),
             accept_bidi: true,
             cutoff_sent: false,
         }

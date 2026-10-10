@@ -1452,7 +1452,7 @@ fn check(w: &World, mock: &[MockObs]) -> Result<(), String> {
     {
         let info = ConnInfo::new(sh.clone());
         let (queued, reservations, _) = info.__debug_recv_accounting();
-        let bound = l.cap + l.demand.max(1) * reservations;
+        let bound = l.cap + l.demand.max(crate::state::MIN_CHARGE) * reservations;
         if queued > bound {
             return Err(format!(
                 "{side:?}: {queued} body bytes queued > C + D × {reservations} = {bound}"

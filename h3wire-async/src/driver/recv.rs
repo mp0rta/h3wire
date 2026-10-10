@@ -14,7 +14,7 @@
 use super::{Driver, dispatch_events};
 use crate::client::decode_head;
 use crate::quic::{self, ReadError, RecvStream, TransportError};
-use crate::state::{Dir, Inner};
+use crate::state::{Dir, Inner, MIN_CHARGE, charge, own};
 use bytes::Bytes;
 use h3wire::{H3Code, Recv, Role, StreamId};
 use std::task::{Context, Poll, Waker};
@@ -45,7 +45,7 @@ impl<C: quic::Connection> Driver<C> {
         if let Some((raw, fin)) = self.shared.with(|i| i.retained.remove(&id)) {
             *budget = budget.saturating_sub(1);
             let n = raw.len().min(max_len);
-            let stop = self.feed(id, &raw.slice(..n), fin && n == raw.len(), tier);
+            let stop = self.feed(id, &raw.slice(..n), fin && n == raw.len(), tier, max_len);
             let off = stop.unwrap_or(n);
             if stop.is_some() || off < raw.len() {
                 self.shared
@@ -78,7 +78,7 @@ impl<C: quic::Connection> Driver<C> {
         });
         match res {
             Ok(Some(chunk)) => {
-                if let Some(off) = self.feed(id, &chunk, false, tier) {
+                if let Some(off) = self.feed(id, &chunk, false, tier, max_len) {
                     self.shared
                         .with(|i| i.retained.insert(id, (chunk.slice(off..), false)));
                 }
@@ -86,7 +86,7 @@ impl<C: quic::Connection> Driver<C> {
             }
             Ok(None) => {
                 self.recvs.remove(&id);
-                if self.feed(id, &Bytes::new(), true, tier).is_some() {
+                if self.feed(id, &Bytes::new(), true, tier, max_len).is_some() {
                     self.shared
                         .with(|i| i.retained.insert(id, (Bytes::new(), true)));
                 }
@@ -146,7 +146,7 @@ impl<C: quic::Connection> Driver<C> {
                         }
                     }
                 };
-                if let Some(off) = self.feed(id, &chunk, fin, Tier::Speculative) {
+                if let Some(off) = self.feed(id, &chunk, fin, Tier::Speculative, usize::MAX) {
                     self.shared
                         .with(|i| i.retained.insert(id, (chunk.slice(off..), fin)));
                     if off == 0 {
@@ -172,31 +172,45 @@ impl<C: quic::Connection> Driver<C> {
         if r.reservation.is_some() && r.queue.is_empty() {
             return Some((Tier::Demand, self.demand_chunk)); // in flight
         }
+        // Below `MIN_CHARGE` of room no chunk fits: wait for consumption (or demand).
         let room = self.read_ahead.saturating_sub(r.queued);
-        if room.min(cap_room) > 0 {
+        if room.min(cap_room) >= MIN_CHARGE {
             return Some((Tier::Speculative, room.min(cap_room)));
         }
         if r.queue.is_empty() && r.consumer_waiting && r.reservation.is_none() {
             r.reservation = Some(self.demand_chunk);
             return Some((Tier::Demand, self.demand_chunk));
         }
-        if room > 0 {
+        if room >= MIN_CHARGE {
             i.cap_waiters.insert(id);
         }
         None
     }
 
     /// Feed `chunk` to the core, dispatching events after each call; body slices are
-    /// queued zero-copy under `tier`. `None`: everything (and `fin`) was fed. `Some(off)`:
-    /// stopped at `off` (paused, or discovery ended); the rest belongs in `retained`.
-    fn feed(&self, id: StreamId, chunk: &Bytes, fin: bool, tier: Tier) -> Option<usize> {
+    /// queued under `tier` ([`own`]), charging at most `budget` in all (body tiers).
+    /// `None`: everything (and `fin`) was fed. `Some(off)`: stopped at `off` (paused,
+    /// discovery ended, or the budget is spent); the rest belongs in `retained`.
+    fn feed(
+        &self,
+        id: StreamId,
+        chunk: &Bytes,
+        fin: bool,
+        tier: Tier,
+        budget: usize,
+    ) -> Option<usize> {
+        let budget = if tier == Tier::Discovery {
+            usize::MAX
+        } else {
+            budget
+        };
         let demand = tier == Tier::Demand;
         self.shared.with(|i| {
             if demand {
                 // Counts the bytes this read queues; cleared below if it queued none.
                 set_reservation(i, id, Some(0));
             }
-            let stop = feed_core(i, id, chunk, fin, tier);
+            let stop = feed_core(i, id, chunk, fin, tier, budget);
             if demand
                 && i.streams
                     .get(&id)
@@ -215,13 +229,28 @@ fn set_reservation(i: &mut Inner, id: StreamId, r: Option<usize>) {
     }
 }
 
-fn feed_core(i: &mut Inner, id: StreamId, chunk: &Bytes, fin: bool, tier: Tier) -> Option<usize> {
+fn feed_core(
+    i: &mut Inner,
+    id: StreamId,
+    chunk: &Bytes,
+    fin: bool,
+    tier: Tier,
+    mut budget: usize,
+) -> Option<usize> {
     let mut off = 0;
     loop {
-        let bytes = &chunk[off..];
-        if bytes.is_empty() && !fin {
+        let rest = &chunk[off..];
+        if rest.is_empty() && !fin {
             return None;
         }
+        // A body slice is no longer than the input it came from and charges at least
+        // `MIN_CHARGE`: with the input clipped to a budget of at least that, its charge
+        // fits.
+        if !rest.is_empty() && budget < MIN_CHARGE {
+            return Some(off);
+        }
+        let bytes = &rest[..rest.len().min(budget)];
+        let fin = fin && bytes.len() == rest.len();
         // An Err means the core is closed; its CloseConnection is queued.
         let Ok(r) = i.conn.recv(id, bytes, fin) else {
             return None;
@@ -229,7 +258,8 @@ fn feed_core(i: &mut Inner, id: StreamId, chunk: &Bytes, fin: bool, tier: Tier) 
         off += match r {
             Recv::Paused => return Some(off),
             Recv::Body { consumed, range } => {
-                let b = chunk.slice(off + range.start..off + range.end);
+                let b = own(chunk, off + range.start..off + range.end);
+                budget = budget.saturating_sub(charge(b.len()));
                 i.queue_body(id, b, tier == Tier::Demand);
                 consumed
             }

@@ -265,7 +265,8 @@ fn original_body_detached_after_claim() {
         peer.send_body(s, b"early", false);
         let (mut req, tx) = drive(&mut peer, &mut reqs.next()).await.unwrap();
         let info = req.extensions().get::<ConnInfo>().unwrap().clone();
-        peer.run_until(|_| info.__debug_recv_accounting().0 == 5)
+        // 5 bytes, charged `MIN_CHARGE`.
+        peer.run_until(|_| info.__debug_recv_accounting().0 == 64)
             .await;
         let mut on = upgrade::on(&mut req);
         assert!(req.body().is_end_stream());
@@ -273,7 +274,7 @@ fn original_body_detached_after_claim() {
         assert!(frame.is_none(), "EOF");
         drop(req);
         settle(&mut peer).await;
-        assert_eq!(info.__debug_recv_accounting().0, 5, "kept for the tunnel");
+        assert_eq!(info.__debug_recv_accounting().0, 64, "kept for the tunnel");
         tx.send(reply(200, "")).unwrap();
         let mut t = drive(&mut peer, &mut on).await.expect("a tunnel");
         assert_eq!(

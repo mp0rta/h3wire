@@ -14,8 +14,34 @@ use bytes::Bytes;
 use h3wire::{AbortSource, Connection, H3Code, HeaderBlockId, StreamId, UsageError};
 use http::HeaderMap;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Wake, Waker};
+
+/// Received body and datagram bytes shorter than this are copied out of the transport's
+/// chunk rather than sliced: a slice keeps the chunk's whole allocation alive (on quinn a
+/// packet buffer, up to a 64 KiB GRO batch) for its few counted bytes.
+// ponytail: a longer zero-copy slice may still pin up to 64 KiB / COPY_BELOW = 16× its
+// length; coalesce small slices into a tail buffer if that ceiling ever matters.
+const COPY_BELOW: usize = 4096;
+
+/// The least one queued body chunk, or one pending datagram, counts against its limits:
+/// the bookkeeping of the entry (its queue slot and allocation).
+pub(crate) const MIN_CHARGE: usize = 64;
+
+/// What an entry of `len` bytes counts against the receive and datagram limits.
+pub(crate) fn charge(len: usize) -> usize {
+    len.max(MIN_CHARGE)
+}
+
+/// `chunk[r]` to keep: copied when short (`COPY_BELOW`), else a zero-copy slice.
+pub(crate) fn own(chunk: &Bytes, r: Range<usize>) -> Bytes {
+    if r.len() < COPY_BELOW {
+        Bytes::copy_from_slice(&chunk[r])
+    } else {
+        chunk.slice(r)
+    }
+}
 
 /// Which half of a stream a readiness token is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -196,11 +222,12 @@ pub(crate) struct SendState {
 pub(crate) struct RecvState {
     /// Parsed body bytes, oldest first. Bytes of a demand read sit at the front.
     pub queue: VecDeque<Bytes>,
+    /// What the queue counts against the limits: each chunk's [`charge`].
     pub queued: usize,
     /// The part of `queued` counted against the connection's read-ahead cap.
     pub speculative: usize,
-    /// A demand reservation: `Some(n)` with `n` bytes of it still queued; while the queue
-    /// is empty, the demand read is in flight.
+    /// A demand reservation: `Some(n)` with `n` of it still queued (charged); while the
+    /// queue is empty, the demand read is in flight.
     pub reservation: Option<usize>,
     /// The core finished the receive side (`Event::Finished`), or the error was yielded.
     pub eof: bool,
@@ -523,8 +550,9 @@ impl Inner {
         }
     }
 
-    /// Queue a body slice of `id`; `demand` counts it against the stream's reservation.
-    /// Bytes of an abandoned or drained body (no reader) are dropped.
+    /// Queue a body slice of `id`, counting its [`charge`]; `demand` counts it against
+    /// the stream's reservation. Bytes of an abandoned or drained body (no reader) are
+    /// dropped.
     pub(crate) fn queue_body(&mut self, id: StreamId, b: Bytes, demand: bool) {
         let Some(st) = self
             .streams
@@ -534,12 +562,13 @@ impl Inner {
             return;
         };
         let r = &mut st.recv;
-        r.queued += b.len();
+        let c = charge(b.len());
+        r.queued += c;
         match (demand, &mut r.reservation) {
-            (true, Some(n)) => *n += b.len(),
+            (true, Some(n)) => *n += c,
             _ => {
-                r.speculative += b.len();
-                self.speculative += b.len();
+                r.speculative += c;
+                self.speculative += c;
             }
         }
         r.queue.push_back(b);
@@ -550,13 +579,14 @@ impl Inner {
     pub(crate) fn pop_body(&mut self, id: StreamId) -> Option<Bytes> {
         let r = &mut self.streams.get_mut(&id)?.recv;
         let b = r.queue.pop_front()?;
-        r.queued -= b.len();
+        let c = charge(b.len());
+        r.queued -= c;
         match r.reservation {
             // Demand bytes are at the front, and a chunk is never split between tiers.
-            Some(n) if n > 0 => r.reservation = (n > b.len()).then(|| n - b.len()),
+            Some(n) if n > 0 => r.reservation = (n > c).then(|| n - c),
             _ => {
-                r.speculative -= b.len();
-                self.speculative -= b.len();
+                r.speculative -= c;
+                self.speculative -= c;
                 for w in std::mem::take(&mut self.cap_waiters) {
                     self.push_ready(w, Dir::Recv);
                 }

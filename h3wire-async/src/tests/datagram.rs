@@ -6,7 +6,7 @@
 
 use super::client::{client, drive, get, seen};
 use super::driver::{done, poll_once, spawn, take};
-use super::recv::yield_now;
+use super::recv::{held_bytes, yield_now};
 use super::upgrade::{
     Handed, Handoff, aborted_any, connect, out, plain, reply, request, reset_by, stopped_by, until,
 };
@@ -164,7 +164,7 @@ fn pending_until_registration() {
         for m in ["a", "bb", "ccc"] {
             peer.send_datagram(s, m.as_bytes()).unwrap();
         }
-        until(|| info.__debug_datagram_accounting() == (0, 3, 6)).await;
+        until(|| info.__debug_datagram_accounting() == (0, 3, 3 * 64)).await;
         let mut d = slot(&req).register().unwrap();
         assert_eq!(info.__debug_datagram_accounting(), (3, 0, 0));
         for m in ["a", "bb", "ccc"] {
@@ -183,7 +183,7 @@ fn unregistered_server(pending: bool) {
         negotiated(&mut peer).await;
         if pending {
             peer.send_datagram(s, b"x").unwrap();
-            until(|| info.__debug_datagram_accounting() == (0, 1, 1)).await;
+            until(|| info.__debug_datagram_accounting() == (0, 1, 64)).await;
         }
         tx.send(reply(200, "ok")).unwrap();
         if !pending {
@@ -209,7 +209,7 @@ fn unregistered_client() {
         })
         .await;
         peer.send_datagram(s, b"x").unwrap();
-        until(|| info.__debug_datagram_accounting() == (0, 1, 1)).await;
+        until(|| info.__debug_datagram_accounting() == (0, 1, 64)).await;
         peer.send_headers(s, &[(":status", "200")], false).unwrap();
         wait(&mut peer, |_| done(&resp)).await;
         let resp = take(&resp).expect("a response");
@@ -279,9 +279,10 @@ fn registered_rejected_connect_drops_silently() {
 #[test]
 fn pending_overflow_evicts_oldest() {
     let mut b = Builder::new();
-    // Per stream: 3 datagrams; per connection: 4 bytes (each datagram is 1 byte).
+    // Per stream: 3 datagrams; per connection: 4 datagrams' worth of bytes (each 1-byte
+    // datagram counts `MIN_CHARGE` = 64).
     b.pending_datagrams_per_stream(3, 1 << 20)
-        .pending_datagrams_per_conn(100, 4);
+        .pending_datagrams_per_conn(100, 4 * 64);
     let (net, info, mut peer, mut reqs, exec) = server(&b, true);
     run(&exec, async {
         let (s0, (r0, _t0)) = open(&mut peer, &mut reqs, &CONNECT).await;
@@ -290,11 +291,11 @@ fn pending_overflow_evicts_oldest() {
         for m in ["0", "1", "2", "3", "4"] {
             peer.send_datagram(s0, m.as_bytes()).unwrap();
         }
-        until(|| info.__debug_datagram_accounting() == (0, 3, 3)).await;
+        until(|| info.__debug_datagram_accounting() == (0, 3, 3 * 64)).await;
         for m in ["a", "b"] {
             peer.send_datagram(s4, m.as_bytes()).unwrap();
         }
-        until(|| info.__debug_datagram_accounting() == (0, 4, 4)).await;
+        until(|| info.__debug_datagram_accounting() == (0, 4, 4 * 64)).await;
         let mut d0 = slot(&r0).register().unwrap();
         let mut d4 = slot(&r4).register().unwrap();
         for m in ["3", "4"] {
@@ -513,5 +514,54 @@ fn slot_clone_single_registration() {
         tx.send(reply(200, "")).unwrap();
         assert!(resp_slot(&out(&resp).await.unwrap()).is_none());
         drop(req);
+    });
+}
+
+/// A 1-byte datagram for `s`, sent as a slice of its own 64 KiB packet buffer (as
+/// quinn's datagrams are); returns the buffer.
+fn tiny_datagram(peer: &mut Peer, s: StreamId) -> Bytes {
+    let mut prefix = [0; 8];
+    let n = peer.core().datagram_prefix(s, &mut prefix).unwrap();
+    let mut v = vec![0u8; 65_536];
+    v[..n].copy_from_slice(&prefix[..n]);
+    v[n] = 7;
+    let buf = Bytes::from(v);
+    peer.send_datagram_raw(buf.slice(..n + 1));
+    buf
+}
+
+/// Tiny datagrams sliced out of large packet buffers pin none of them, pending or
+/// queued for the handle: what is kept alive stays within 2× what the pending caps
+/// count, and within 2 × 64 bytes per queued datagram.
+#[test]
+fn tiny_datagrams_do_not_pin_packet_buffers() {
+    let (_net, c, srv_conn) = MockNet::pair();
+    let exec = TestExec::default();
+    let (tx, mut reqs) = mpsc::unbounded();
+    let srv = Builder::new().serve_connection(srv_conn, Handoff(tx), exec.clone());
+    let shared = srv.driver.shared();
+    let info = ConnInfo::new(shared.clone());
+    spawn(&exec, srv);
+    let mut peer = CorePeer::new(Role::Client, peer_cfg(true), c);
+    run(&exec, async {
+        let (s, (req, _tx)) = open(&mut peer, &mut reqs, &CONNECT).await;
+        negotiated(&mut peer).await;
+        let mut bufs: Vec<Bytes> = (0..8).map(|_| tiny_datagram(&mut peer, s)).collect();
+        wait(&mut peer, |_| info.__debug_datagram_accounting().1 == 8).await;
+        let counted = info.__debug_datagram_accounting().2;
+        let held = shared.with(|i| held_bytes(i.dgram.pending.iter().map(|(_, d)| d), &bufs));
+        assert!(
+            held <= 2 * counted,
+            "{held} bytes kept alive for {counted} counted"
+        );
+
+        let _d = slot(&req).register().unwrap();
+        bufs.extend((0..8).map(|_| tiny_datagram(&mut peer, s)));
+        wait(&mut peer, |_| info.__debug_datagram_accounting().0 == 16).await;
+        let held = shared.with(|i| held_bytes(i.streams[&s].dgram.queue.iter(), &bufs));
+        assert!(
+            held <= 16 * 2 * 64,
+            "{held} bytes kept alive by 16 datagrams"
+        );
     });
 }

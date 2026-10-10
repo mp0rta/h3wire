@@ -18,7 +18,7 @@ use super::Driver;
 use crate::builder::Builder;
 use crate::error::Error;
 use crate::quic::{self, SendDatagramError, TransportError};
-use crate::state::Inner;
+use crate::state::{Inner, charge, own};
 use bytes::Bytes;
 use h3wire::{Datagram, H3Code, StreamId};
 use std::collections::VecDeque;
@@ -50,6 +50,7 @@ pub(crate) struct Dgrams {
     pub limit: Option<usize>,
     /// Datagrams of undecided streams, oldest first.
     pub pending: VecDeque<(StreamId, Bytes)>,
+    /// What `pending` counts against the byte caps: each datagram's `charge`.
     pub pending_bytes: usize,
     /// Prefixed datagrams the handles queued for the transport (drop-oldest).
     pub out: VecDeque<Bytes>,
@@ -75,11 +76,11 @@ impl Dgrams {
     // ponytail: linear scans over `pending` (256 by default); index per stream if the
     // caps are raised far.
     fn pend(&mut self, id: StreamId, b: Bytes) {
-        self.pending_bytes += b.len();
+        self.pending_bytes += charge(b.len());
         self.pending.push_back((id, b));
         loop {
             let mine = self.pending.iter().filter(|(s, _)| *s == id);
-            let (n, bytes) = mine.fold((0, 0), |(n, sz), (_, b)| (n + 1, sz + b.len()));
+            let (n, bytes) = mine.fold((0, 0), |(n, sz), (_, b)| (n + 1, sz + charge(b.len())));
             if n <= self.stream_cap.0 && bytes <= self.stream_cap.1 {
                 break;
             }
@@ -93,7 +94,7 @@ impl Dgrams {
 
     fn evict(&mut self, at: usize) {
         if let Some((_, b)) = self.pending.remove(at) {
-            self.pending_bytes -= b.len();
+            self.pending_bytes -= charge(b.len());
         }
     }
 
@@ -104,7 +105,7 @@ impl Dgrams {
             .partition::<VecDeque<_>, _>(|(s, _)| *s == id);
         self.pending = rest;
         let mine: Vec<Bytes> = mine.into_iter().map(|(_, b)| b).collect();
-        self.pending_bytes -= mine.iter().map(Bytes::len).sum::<usize>();
+        self.pending_bytes -= mine.iter().map(|b| charge(b.len())).sum::<usize>();
         mine
     }
 }
@@ -162,7 +163,7 @@ impl Inner {
         let Ok(Datagram::Deliver(id, range)) = self.conn.parse_datagram(&payload) else {
             return; // NotYetOpen, Drop
         };
-        let b = payload.slice(range);
+        let b = own(&payload, range);
         let cap = self.dgram.queue_cap;
         let Some(d) = self.streams.get_mut(&id).map(|s| &mut s.dgram) else {
             return;

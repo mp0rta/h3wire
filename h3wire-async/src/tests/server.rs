@@ -772,7 +772,7 @@ fn abandoned_body_then_unrelated_wait_is_cancelled() {
         let a = open(&mut s.peer, &req("POST", "/"), false).await;
         s.peer.send_body(a, b"abc", false);
         s.peer
-            .run_until(|_| info.__debug_recv_accounting().0 == 3)
+            .run_until(|_| info.__debug_recv_accounting().0 == 64) // 3 bytes, charged 64
             .await;
         drop_tx.send(()).unwrap();
         s.peer

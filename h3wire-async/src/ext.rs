@@ -2,7 +2,7 @@
 // Copyright (c) 2026 mp0rta
 //! Request/response extensions.
 
-use crate::state::Shared;
+use crate::state::{Shared, charge};
 use bytes::Bytes;
 use h3wire::{PeerSettings, StreamId};
 use std::future::poll_fn;
@@ -43,7 +43,7 @@ pub struct DebugStream {
     pub send_chunks: Vec<usize>,
     /// Datagrams in the registered handle's queue.
     pub dgram_queue: usize,
-    /// Pending (undecided) datagrams: count and bytes.
+    /// Pending (undecided) datagrams: count and bytes (charged).
     pub pending_dgrams: (usize, usize),
 }
 
@@ -69,8 +69,8 @@ impl ConnInfo {
         self.shared.with(|i| i.conn.peer_settings().cloned())
     }
 
-    /// Receive accounting for the bound oracle: (queued body bytes, streams holding a
-    /// demand reservation, retained raw bytes). Not public API.
+    /// Receive accounting for the bound oracle: (queued body bytes as charged, streams
+    /// holding a demand reservation, retained raw bytes). Not public API.
     #[doc(hidden)]
     pub fn __debug_recv_accounting(&self) -> (usize, usize, usize) {
         self.shared.with(|i| {
@@ -116,7 +116,8 @@ impl ConnInfo {
                             s.send.queue.iter().map(Bytes::len).collect()
                         }),
                         dgram_queue: st.map_or(0, |s| s.dgram.queue.len()),
-                        pending_dgrams: pending.fold((0, 0), |(n, b), (_, d)| (n + 1, b + d.len())),
+                        pending_dgrams: pending
+                            .fold((0, 0), |(n, b), (_, d)| (n + 1, b + charge(d.len()))),
                     }
                 })
                 .collect();

@@ -413,7 +413,7 @@ fn paused_bytes_and_fin_preserved() {
             assert!(!r.eof && r.trailers.is_none());
         });
         let (queued, _, retained) = info.__debug_recv_accounting();
-        assert_eq!(queued, 3);
+        assert_eq!(queued, 64, "3 bytes, charged `MIN_CHARGE`");
         assert!(retained > 0, "the paused trailers are retained");
         let mut body = take_body(&shared, s);
         assert_eq!(&data(next_frame(&mut peer, &mut body).await)[..], b"abc");
@@ -460,8 +460,9 @@ fn drop_body_early_aborts_request_cancelled() {
     });
 }
 
+/// Short body slices are copied out of the transport chunk; long ones are zero-copy.
 #[test]
-fn zero_copy_slices() {
+fn short_slices_copied_long_ones_zero_copy() {
     let Server {
         mut peer,
         shared,
@@ -470,21 +471,28 @@ fn zero_copy_slices() {
     } = server(&Builder::new());
     run(&exec, async {
         let s = peer.open_bidi().await.unwrap();
-        let chunk = [
-            headers_frame(&REQ),
-            data_frame(&[1; 100]),
-            data_frame(&[2; 100]),
-        ]
-        .concat();
-        peer.send_raw(s, &chunk);
+        let chunk = Bytes::from(
+            [
+                headers_frame(&REQ),
+                data_frame(&[1; 100]),
+                data_frame(&[2; 8000]),
+                data_frame(&[3; 8000]),
+            ]
+            .concat(),
+        );
+        peer.send_raw_bytes(s, chunk.clone());
         peer.run_until(|_| has_head(&shared, s)).await;
         let mut body = take_body(&shared, s);
         let a = data(next_frame(&mut peer, &mut body).await);
         let b = data(next_frame(&mut peer, &mut body).await);
-        assert_eq!((&a[..], &b[..]), (&[1; 100][..], &[2; 100][..]));
-        // Both are slices of the one transport chunk: b starts after a and b's 3-byte
-        // frame header.
-        assert_eq!(b.as_ptr() as usize, a.as_ptr() as usize + 100 + 3);
+        let c = data(next_frame(&mut peer, &mut body).await);
+        assert_eq!(&a[..], &[1; 100][..]);
+        assert_eq!((&b[..], &c[..]), (&[2; 8000][..], &[3; 8000][..]));
+        assert!(!within(&a, &chunk), "a short slice is a copy");
+        // Both long ones are slices of the transport chunk: c starts after b and c's
+        // 3-byte frame header.
+        assert!(within(&b, &chunk) && within(&c, &chunk));
+        assert_eq!(c.as_ptr() as usize, b.as_ptr() as usize + 8000 + 3);
     });
 }
 
@@ -561,6 +569,82 @@ fn cap_room_wakes_held_back_streams() {
             queued(&shared, ids[held]),
             65_536,
             "read-ahead resumed without demand"
+        );
+    });
+}
+
+/// `chunk` lies inside `buf`'s allocation (it is a slice of it).
+pub(super) fn within(chunk: &Bytes, buf: &Bytes) -> bool {
+    let (c, b) = (chunk.as_ptr() as usize, buf.as_ptr() as usize);
+    c >= b && c < b + buf.len()
+}
+
+/// Bytes kept alive by `held`: the packet buffers any of them still slices (whole),
+/// the other entries' own bytes, and one queue slot per entry.
+pub(super) fn held_bytes<'a>(
+    held: impl Iterator<Item = &'a Bytes> + Clone,
+    bufs: &[Bytes],
+) -> usize {
+    let pinned: usize = bufs
+        .iter()
+        .filter(|b| held.clone().any(|c| within(c, b)))
+        .map(Bytes::len)
+        .sum();
+    let own: usize = held
+        .clone()
+        .filter(|c| !bufs.iter().any(|b| within(c, b)))
+        .map(Bytes::len)
+        .sum();
+    pinned + own + held.count() * size_of::<Bytes>()
+}
+
+/// A 64 KiB "packet buffer" full of 1-byte DATA frames.
+pub(super) fn packet_buffer(frame: &[u8]) -> Bytes {
+    frame
+        .iter()
+        .copied()
+        .cycle()
+        .take(65_536)
+        .collect::<Vec<u8>>()
+        .into()
+}
+
+/// A peer flooding 1-byte DATA frames, each its own transport chunk sliced out of a
+/// large packet buffer (as quinn's chunks are), pins neither those buffers nor more
+/// queue slots than the read-ahead counts: what the queue keeps alive stays within 2×
+/// the counted bytes, which stay within the read-ahead.
+#[test]
+fn tiny_frames_do_not_pin_packet_buffers() {
+    const RA: usize = 16_384;
+    let mut b = Builder::new();
+    b.read_ahead(RA);
+    let Server {
+        mut peer,
+        shared,
+        info,
+        exec,
+        ..
+    } = server(&b);
+    let bufs: Vec<Bytes> = (0..4).map(|_| packet_buffer(&[0x00, 0x01, 7])).collect();
+    run(&exec, async {
+        let s = peer.open_bidi().await.unwrap();
+        peer.send_headers(s, &REQ, false).unwrap();
+        for buf in &bufs {
+            for k in 0..256 {
+                peer.send_raw_bytes(s, buf.slice(3 * k..3 * k + 3));
+            }
+        }
+        peer.run_until(|_| has_head(&shared, s)).await;
+        let _body = take_body(&shared, s);
+        for _ in 0..8 {
+            settle(&mut peer).await;
+        }
+        let counted = info.__debug_recv_accounting().0;
+        let held = shared.with(|i| held_bytes(i.streams[&s].recv.queue.iter(), &bufs));
+        assert!(counted > 0 && counted <= RA, "{counted}");
+        assert!(
+            held <= 2 * counted,
+            "{held} bytes kept alive for {counted} counted"
         );
     });
 }

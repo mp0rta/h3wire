@@ -75,6 +75,10 @@ impl Builder {
     }
 
     /// Per-stream body read-ahead without application demand. Default 64 KiB.
+    ///
+    /// The receive limits count each queued body chunk as its length, but at least 64
+    /// bytes (its bookkeeping); chunks shorter than 4 KiB are copied out of the
+    /// transport's buffer, longer ones are kept zero-copy.
     pub fn read_ahead(&mut self, n: usize) -> &mut Self {
         self.read_ahead = n;
         self
@@ -86,7 +90,8 @@ impl Builder {
         self
     }
 
-    /// Bytes read per demand reservation. Default 16 KiB.
+    /// Bytes read per demand reservation. Default 16 KiB; values below 64 count as 64
+    /// (see [`read_ahead`](Self::read_ahead) for how queued bytes are counted).
     pub fn demand_chunk(&mut self, n: usize) -> &mut Self {
         self.demand_chunk = n;
         self
@@ -112,13 +117,14 @@ impl Builder {
     }
 
     /// Pending (not yet registered) datagrams kept per stream: count and bytes. Default
-    /// 16 datagrams / 16 KiB.
+    /// 16 datagrams / 16 KiB. Each datagram counts its length, but at least 64 bytes.
     pub fn pending_datagrams_per_stream(&mut self, count: usize, bytes: usize) -> &mut Self {
         self.pending_dgrams_stream = (count, bytes);
         self
     }
 
-    /// Pending datagrams kept per connection: count and bytes. Default 256 / 256 KiB.
+    /// Pending datagrams kept per connection: count and bytes (counted as per stream).
+    /// Default 256 / 256 KiB.
     pub fn pending_datagrams_per_conn(&mut self, count: usize, bytes: usize) -> &mut Self {
         self.pending_dgrams_conn = (count, bytes);
         self
