@@ -195,6 +195,14 @@ Chrome is tested by hand once; the steps and the result are recorded here.
 
 **Record**
 
-- Date: _to be filled in_
-- Chrome version: _to be filled in_
-- Result: not yet run (manual step pending)
+- Date: 2026-10-13
+- Chrome version: 155.0.8059.39 (Linux), run with `--headless=new --dump-dom` and
+  `--log-net-log` in place of the DevTools panel
+- Result: `/bytes/1000` passes. The page body is exactly 1000 `a` characters, the
+  request is bound to a QUIC session with HTTP/3 frames in the net log, and the server
+  logs `accepted` then `closed cleanly`.
+- Result: `/trailers` fails in Chrome, not in h3wire. Chrome receives `:status: 200`,
+  the 9-byte DATA frame and the trailer `x-check: ok` with FIN, with no reset, then fails
+  the body read with `ERR_CONNECTION_CLOSED` (-100). It fails the same way when the
+  trailers arrive 200 ms later in a separate packet, and against a hyperium h3 0.0.8
+  server sending the same response. A response without trailers loads.
