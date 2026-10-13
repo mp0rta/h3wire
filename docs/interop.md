@@ -189,8 +189,11 @@ Chrome is tested by hand once; the steps and the result are recorded here.
 5. Check the two pages:
    - `/bytes/1000` shows 1000 `a` characters, and the DevTools Network panel shows the
      protocol `h3`;
-   - `/trailers` loads the body `trailers` over `h3` without an error. Chrome does not
-     display trailers.
+   - `/trailers`: Chrome (as of 155) fails every h3 response that carries trailers
+     with `ERR_CONNECTION_CLOSED`, whatever the server, so the page shows an error.
+     Check the net log instead (`--log-net-log=<file>`, or `chrome://net-export`):
+     the stream delivers `:status: 200`, a 9-byte DATA frame and the trailer
+     `x-check: ok` with FIN, and no reset is received.
 6. Close Chrome. The server log shows the connection as `accepted`, then `closed`.
 
 **Record**
